@@ -144,6 +144,10 @@ type uploadURLOutput struct {
 	Method    string    `json:"method"`
 	ExpiresAt time.Time `json:"expires_at"`
 	Curl      string    `json:"curl"`
+	// The public proxy rejects request bodies over 100 MB, so larger files
+	// must be sent in parts.
+	MaxSingleRequestMB int    `json:"max_single_request_mb"`
+	CurlChunked        string `json:"curl_chunked"`
 }
 
 type downloadURLOutput struct {
@@ -177,7 +181,7 @@ func New(cfg Config) *mcp.Server {
 	destructive := &mcp.ToolAnnotations{DestructiveHint: ptr(true), OpenWorldHint: &closed}
 
 	add(srv, "upload_file", "Upload a new file and get its public URL. Give exactly one of content_text, content_base64 or source_url. Omit namespace for a fresh unguessable URL; pass a namespace to group files. Optionally set a password.", fetching, s.upload)
-	add(srv, "create_upload_url", "Get a short-lived URL that accepts the file bytes over HTTP (PUT raw body, or POST multipart with a \"file\" field), for files too large to send inline. Use it with curl --upload-file. Pass file to replace an existing file instead.", additive, s.uploadURL)
+	add(srv, "create_upload_url", "Get a short-lived URL that accepts the file bytes over HTTP, for files too large to send inline. Files up to 95 MB: run the returned curl (PUT raw body). Larger files: run curl_chunked, which PUTs 90 MB parts with ?part=N and then POSTs ?complete=N. Pass file to replace an existing file instead.", additive, s.uploadURL)
 	add(srv, "replace_file", "Replace a file's content, keeping its URL and password. The previous content stays available as an older version for the retention window. Give exactly one of content_text, content_base64 or source_url.", fetching, s.replace)
 	mcp.AddTool(srv, &mcp.Tool{Name: "read_file", Description: "Read a file's content (current or an older version). Text comes back as text, other files as base64; images are also returned as images.", Annotations: readOnly}, s.read)
 	add(srv, "create_download_url", "Get a short-lived private URL for the exact bytes of a version of a file. It works even for password-protected or deleted files.", readOnly, s.downloadURL)
@@ -348,7 +352,11 @@ func (s *server) uploadURL(ctx context.Context, in UploadURLInput) (uploadURLOut
 	u := s.files.BaseURL() + "/upload/" + s.auth.SignUpload(grant, ttl)
 	return uploadURLOutput{
 		UploadURL: u, Method: "PUT", ExpiresAt: time.Now().Add(ttl).UTC().Truncate(time.Second),
-		Curl: fmt.Sprintf("curl --fail-with-body --upload-file ./LOCAL_FILE '%s'", u),
+		Curl:               fmt.Sprintf("curl --fail-with-body --upload-file ./LOCAL_FILE '%s'", u),
+		MaxSingleRequestMB: 95,
+		CurlChunked: fmt.Sprintf(`f=./LOCAL_FILE; u='%s'; d=$(mktemp -d) && split -b 90m "$f" "$d/p." && n=0 && `+
+			`for p in "$d"/p.*; do n=$((n+1)); curl -sS --fail-with-body -X PUT --upload-file "$p" "$u?part=$n" >/dev/null || exit 1; done && `+
+			`curl -sS --fail-with-body -X POST "$u?complete=$n"; rm -rf "$d"`, u),
 	}, nil
 }
 

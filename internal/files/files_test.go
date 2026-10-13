@@ -31,6 +31,7 @@ func newHarness(t *testing.T) *harness {
 	ctx := context.Background()
 	c := &clock{t: time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)}
 	blobs := blob.NewMemory()
+	blobs.Now = c.now
 	svc, err := Open(ctx, Config{
 		DatabaseURL: pgtest.New(t),
 		Blobs:       blobs,
@@ -370,5 +371,56 @@ func TestListSearchAndStats(t *testing.T) {
 	}
 	if !slices.Contains(names, "cat.png") {
 		t.Fatal("cat missing")
+	}
+}
+
+func TestChunkedUploads(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	const key = "0123456789abcdef0123456789abcdef"
+	for i, chunk := range []string{"alpha-", "beta-", "gamma"} {
+		if _, err := h.svc.PutPart(ctx, key, i+1, strings.NewReader(chunk), -1); err != nil {
+			t.Fatalf("part %d: %v", i+1, err)
+		}
+	}
+	if _, err := h.svc.PutPart(ctx, key, 0, strings.NewReader("x"), -1); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("part 0: %v", err)
+	}
+	if _, err := h.svc.PutPart(ctx, "../evil", 1, strings.NewReader("x"), -1); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("bad key: %v", err)
+	}
+	// Completing with a missing part fails and keeps the parts.
+	_, err := h.svc.CompleteParts(ctx, key, 4, func(r io.Reader) (File, error) { t.Fatal("assembled with a missing part"); return File{}, nil })
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("missing part: %v", err)
+	}
+	f, err := h.svc.CompleteParts(ctx, key, 3, func(r io.Reader) (File, error) {
+		return h.svc.Upload(ctx, UploadInput{Name: "joined.txt", Body: r, Size: -1})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.read(t, f, 0); got != "alpha-beta-gamma" || f.Size != 16 {
+		t.Fatalf("assembled = %q (%d bytes)", got, f.Size)
+	}
+	if n := len(h.blobs.Keys()); n != 1 {
+		t.Fatalf("parts not cleaned up: %v", h.blobs.Keys())
+	}
+}
+
+func TestPurgeRemovesAbandonedParts(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.svc.PutPart(ctx, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1, strings.NewReader("orphan"), -1); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.t = h.clock.t.Add(23 * time.Hour)
+	if res, _ := h.svc.Purge(ctx); res.Parts != 0 {
+		t.Fatalf("fresh part purged: %+v", res)
+	}
+	h.clock.t = h.clock.t.Add(2 * time.Hour)
+	res, err := h.svc.Purge(ctx)
+	if err != nil || res.Parts != 1 || len(h.blobs.Keys()) != 0 {
+		t.Fatalf("stale part not purged: %+v %v %v", res, err, h.blobs.Keys())
 	}
 }

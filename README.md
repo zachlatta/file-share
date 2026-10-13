@@ -21,7 +21,10 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
   cookie is bound to the current password, so changing it locks out old sessions. Scripts can
   use `?password=` or HTTP Basic auth.
 - **Large files.** `create_upload_url` returns a short-lived signed URL that takes a plain
-  `curl --upload-file`, so agents never base64 big files through a chat message.
+  `curl --upload-file`, so agents never base64 big files through a chat message. Cloudflare
+  rejects request bodies over 100 MB, so bigger files go up in parts: `PUT <url>?part=1..N`
+  (each part 90 MB or less), then `POST <url>?complete=N`. The tool returns a ready-made
+  `curl_chunked` script. Unfinished parts are deleted after 24 hours.
   `create_download_url` does the same for downloads, including old versions, password-protected
   files and deleted files.
 
@@ -58,6 +61,9 @@ curl -H "$AUTH" "https://files.zachlatta.com/api/files?q=photo&deleted=false"   
 curl -H "$AUTH" -X DELETE https://files.zachlatta.com/api/files/<id>                  # delete
 curl -H "$AUTH" -X POST https://files.zachlatta.com/api/files/<id>/restore            # restore
 ```
+
+The same 100 MB per-request ceiling applies to `/api/files` through the public hostname. Use a
+signed upload URL for anything larger.
 
 ## Serving
 

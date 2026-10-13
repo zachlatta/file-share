@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -335,5 +336,36 @@ func TestHealthAndHome(t *testing.T) {
 	}
 	if rec := e.do(httptest.NewRequest(http.MethodGet, "/", nil)); rec.Code != 200 {
 		t.Fatalf("home: %d", rec.Code)
+	}
+}
+
+func TestChunkedSignedUpload(t *testing.T) {
+	e := newEnv(t)
+	token := e.auth.SignUpload(auth.UploadGrant{Filename: "movie.mp4"}, time.Hour)
+	for i, chunk := range []string{"one-", "two-", "three"} {
+		rec := e.do(httptest.NewRequest(http.MethodPut, fmt.Sprintf("/upload/%s?part=%d", token, i+1), strings.NewReader(chunk)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("part %d: %d %s", i+1, rec.Code, rec.Body)
+		}
+	}
+	if rec := e.do(httptest.NewRequest(http.MethodPost, "/upload/"+token+"?complete=4", nil)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("complete with missing part: %d", rec.Code)
+	}
+	rec := e.do(httptest.NewRequest(http.MethodPost, "/upload/"+token+"?complete=3", nil))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("complete: %d %s", rec.Code, rec.Body)
+	}
+	f := decodeFile(t, rec)
+	if f.Name != "movie.mp4" || f.Size != 13 || f.ContentType != "video/mp4" {
+		t.Fatalf("file = %+v", f)
+	}
+	if got := e.do(httptest.NewRequest(http.MethodGet, urlPath(f), nil)); got.Body.String() != "one-two-three" {
+		t.Fatalf("content = %q", got.Body)
+	}
+	// Chunked replace.
+	token = e.auth.SignUpload(auth.UploadGrant{FileID: f.ID}, time.Hour)
+	_ = e.do(httptest.NewRequest(http.MethodPut, "/upload/"+token+"?part=1", strings.NewReader("v2")))
+	if rec := e.do(httptest.NewRequest(http.MethodPost, "/upload/"+token+"?complete=1", nil)); rec.Code != 200 || decodeFile(t, rec).Version != 2 {
+		t.Fatalf("chunked replace: %d %s", rec.Code, rec.Body)
 	}
 }

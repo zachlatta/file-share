@@ -5,6 +5,8 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -356,7 +358,8 @@ func (h *Handler) apiList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
-	grant, err := h.auth.VerifyUpload(r.PathValue("token"))
+	token := r.PathValue("token")
+	grant, err := h.auth.VerifyUpload(token)
 	if err != nil {
 		http.Error(w, "invalid or expired upload link", http.StatusUnauthorized)
 		return
@@ -364,6 +367,42 @@ func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
 	client := grant.ClientName
 	if client == "" {
 		client = "upload-url"
+	}
+	q := r.URL.Query()
+	// Chunked mode, for bodies larger than a proxy allows in one request:
+	// PUT ?part=1..N, then POST ?complete=N.
+	sum := sha256.Sum256([]byte(token))
+	uploadKey := hex.EncodeToString(sum[:16])
+	if q.Has("part") {
+		n, err := strconv.Atoi(q.Get("part"))
+		if err != nil {
+			respond(w, 0, nil, fmt.Errorf("%w: part must be a number", files.ErrInvalid))
+			return
+		}
+		size := r.ContentLength
+		if size == 0 {
+			size = -1
+		}
+		written, err := h.files.PutPart(r.Context(), uploadKey, n, r.Body, size)
+		respond(w, http.StatusOK, map[string]any{"part": n, "size": written}, err)
+		return
+	}
+	if q.Has("complete") {
+		parts, err := strconv.Atoi(q.Get("complete"))
+		if err != nil {
+			respond(w, 0, nil, fmt.Errorf("%w: complete must be the number of parts", files.ErrInvalid))
+			return
+		}
+		status := http.StatusCreated
+		f, err := h.files.CompleteParts(r.Context(), uploadKey, parts, func(body io.Reader) (files.File, error) {
+			if grant.FileID != "" {
+				status = http.StatusOK
+				return h.files.Replace(r.Context(), grant.FileID, files.ReplaceInput{Body: body, Size: -1, Client: client})
+			}
+			return h.files.Upload(r.Context(), files.UploadInput{Namespace: grant.Namespace, Name: grant.Filename, Body: body, Size: -1, Client: client})
+		})
+		respond(w, status, f, err)
+		return
 	}
 	if grant.FileID != "" {
 		f, err := h.replace(r, client, grant.FileID)

@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -30,16 +32,29 @@ type Store interface {
 	Get(ctx context.Context, key string) (Object, error)
 	// Delete removes key; deleting a missing key succeeds.
 	Delete(ctx context.Context, key string) error
+	// List returns the objects whose keys start with prefix.
+	List(ctx context.Context, prefix string) ([]ObjectInfo, error)
 	Ping(ctx context.Context) error
+}
+
+type ObjectInfo struct {
+	Key      string
+	Size     int64
+	Modified time.Time
 }
 
 // Memory is an in-process Store for tests.
 type Memory struct {
-	mu   sync.Mutex
-	data map[string][]byte
+	mu       sync.Mutex
+	data     map[string][]byte
+	modified map[string]time.Time
+	// Now stamps modification times; defaults to time.Now.
+	Now func() time.Time
 }
 
-func NewMemory() *Memory { return &Memory{data: map[string][]byte{}} }
+func NewMemory() *Memory {
+	return &Memory{data: map[string][]byte{}, modified: map[string]time.Time{}, Now: time.Now}
+}
 
 func (m *Memory) Put(_ context.Context, key string, r io.Reader, _ int64, _ string) error {
 	data, err := io.ReadAll(r)
@@ -49,6 +64,7 @@ func (m *Memory) Put(_ context.Context, key string, r io.Reader, _ int64, _ stri
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.data[key] = data
+	m.modified[key] = m.Now()
 	return nil
 }
 
@@ -66,7 +82,20 @@ func (m *Memory) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.data, key)
+	delete(m.modified, key)
 	return nil
+}
+
+func (m *Memory) List(_ context.Context, prefix string) ([]ObjectInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []ObjectInfo
+	for k, v := range m.data {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, ObjectInfo{Key: k, Size: int64(len(v)), Modified: m.modified[k]})
+		}
+	}
+	return out, nil
 }
 
 func (m *Memory) Ping(context.Context) error { return nil }
@@ -152,6 +181,17 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 		return nil
 	}
 	return err
+}
+
+func (s *S3) List(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	var out []ObjectInfo
+	for obj := range s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if obj.Err != nil {
+			return nil, obj.Err
+		}
+		out = append(out, ObjectInfo{Key: obj.Key, Size: obj.Size, Modified: obj.LastModified})
+	}
+	return out, nil
 }
 
 func (s *S3) Ping(ctx context.Context) error {

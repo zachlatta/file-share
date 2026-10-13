@@ -439,6 +439,8 @@ type PurgeResult struct {
 	Files    int `json:"files"`
 	Versions int `json:"versions"`
 	Blobs    int `json:"blobs"`
+	// Parts counts abandoned chunked-upload parts removed.
+	Parts int `json:"parts"`
 }
 
 // Purge permanently removes deleted files and replaced versions that are
@@ -469,8 +471,10 @@ func (s *Service) Purge(ctx context.Context) (PurgeResult, error) {
 	if err != nil {
 		return PurgeResult{}, err
 	}
-	res.Blobs, err = s.deleteOrphanBlobs(ctx, keys)
-	return res, err
+	var blobErr, partErr error
+	res.Blobs, blobErr = s.deleteOrphanBlobs(ctx, keys)
+	res.Parts, partErr = s.purgeParts(ctx)
+	return res, errors.Join(blobErr, partErr)
 }
 
 func (s *Service) blobKeys(ctx context.Context, query string, args ...any) ([]string, error) {

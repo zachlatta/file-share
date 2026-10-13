@@ -205,7 +205,8 @@ func TestSignedURLsAndSourceURL(t *testing.T) {
 	s := connect(t)
 	var up uploadURLOutput
 	ok(t, call(t, s, "create_upload_url", map[string]any{"name": "big.mov"}), &up)
-	if !strings.HasPrefix(up.UploadURL, "https://files.example.com/upload/") || !strings.Contains(up.Curl, "--upload-file") {
+	if !strings.HasPrefix(up.UploadURL, "https://files.example.com/upload/") || !strings.Contains(up.Curl, "--upload-file") ||
+		!strings.Contains(up.CurlChunked, "?part=") || !strings.Contains(up.CurlChunked, "?complete=") || up.MaxSingleRequestMB != 95 {
 		t.Fatalf("upload url = %+v", up)
 	}
 	var f files.File

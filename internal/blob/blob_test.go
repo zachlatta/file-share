@@ -99,6 +99,14 @@ func TestStoreContract(t *testing.T) {
 			if err := store.Delete(ctx, prefix+"never"); err != nil {
 				t.Fatalf("delete missing: %v", err)
 			}
+			// List finds objects under a prefix, with modification times.
+			list, err := store.List(ctx, prefix)
+			if err != nil || len(list) != 1 || list[0].Key != prefix+"b" || list[0].Modified.IsZero() {
+				t.Fatalf("list = %+v, %v", list, err)
+			}
+			if other, _ := store.List(ctx, prefix+"zzz"); len(other) != 0 {
+				t.Fatalf("list of empty prefix = %+v", other)
+			}
 			if err := store.Ping(ctx); err != nil {
 				t.Fatalf("ping: %v", err)
 			}
