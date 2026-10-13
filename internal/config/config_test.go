@@ -63,3 +63,19 @@ func TestValidation(t *testing.T) {
 		t.Errorf("loopback http should be allowed: %v", err)
 	}
 }
+
+func TestHackClubAuth(t *testing.T) {
+	cfg, err := Load(env(nil))
+	if err != nil || cfg.HCAClientID != "" {
+		t.Fatalf("default should leave Hack Club Auth off: %+v %v", cfg, err)
+	}
+	cfg, err = Load(env(map[string]string{"HCA_CLIENT_ID": "cid", "HCA_CLIENT_SECRET": "csecret"}))
+	if err != nil || cfg.HCAClientID != "cid" || cfg.HCAClientSecret != "csecret" || cfg.HCAURL != "https://auth.hackclub.com" {
+		t.Fatalf("cfg = %+v, %v", cfg, err)
+	}
+	for _, partial := range []map[string]string{{"HCA_CLIENT_ID": "cid"}, {"HCA_CLIENT_SECRET": "csecret"}} {
+		if _, err := Load(env(partial)); err == nil || !strings.Contains(err.Error(), "HCA_CLIENT") {
+			t.Errorf("%v: %v", partial, err)
+		}
+	}
+}

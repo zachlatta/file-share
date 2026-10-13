@@ -17,9 +17,16 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
 - **Recoverable deletes.** Deleted files and replaced versions are kept for `RETENTION_DAYS`
   (default 30), during which `restore_file` / `rollback_file` bring them back. An hourly job
   then purges them. `purge_file` destroys a file immediately, for things uploaded by mistake.
-- **Passwords.** Per-file passwords (bcrypt). Visitors get a password page, and the unlock
-  cookie is bound to the current password, so changing it locks out old sessions. Scripts can
-  use `?password=` or HTTP Basic auth.
+- **Share with specific people.** Restrict a file to email addresses (or `@domain.com` for a
+  whole domain). Visitors click **Sign in with Hack Club**, log in with
+  [Hack Club Auth](https://auth.hackclub.com), and only a verified email on the list opens the
+  file. The sign-in is remembered for 30 days per namespace, and every request checks the
+  file's current list, so removing someone takes effect immediately. This is the preferred way
+  to share privately.
+- **Passwords.** Per-file passwords (bcrypt), for people without a Hack Club account. Visitors
+  get a password page, and the unlock cookie is bound to the current password, so changing it
+  locks out old sessions. Scripts can use `?password=` or HTTP Basic auth. If a file has both a
+  password and allowed emails, either one opens it.
 - **Large files.** `create_upload_url` returns a short-lived signed URL that takes a plain
   `curl --upload-file`, so agents never base64 big files through a chat message. Cloudflare
   rejects request bodies over 100 MB, so bigger files go up in parts: `PUT <url>?part=1..N`
@@ -35,7 +42,7 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
 | Upload | `upload_file` (text, base64 or `source_url`), `create_upload_url`, `replace_file` |
 | Read | `read_file`, `create_download_url`, `get_file`, `list_files`, `list_versions`, `get_stats` |
 | History | `rollback_file`, `delete_file`, `restore_file`, `purge_file` |
-| Manage | `rename_file`, `set_password`, `remove_password` |
+| Manage | `rename_file`, `set_allowed_emails`, `set_password`, `remove_password` |
 
 Tools accept a file by ID, public URL, or `namespace/name`.
 
@@ -49,6 +56,11 @@ This is the same design as the personal data warehouse:
   so auth needs no database. Rotating `MCP_SECRET` revokes everything.
 - **Scripts use a static bearer:** `Authorization: Bearer <client_name>:<MCP_SECRET>`.
 - **Signed upload and download URLs** carry their own expiring HMAC grant.
+- **Visitors to email-restricted files** sign in with Hack Club Auth (OpenID Connect,
+  `openid email` scopes). The server exchanges the code with its client secret, reads the
+  verified email from the userinfo endpoint, and stores it in an HMAC-signed, HttpOnly cookie
+  scoped to that file's namespace. The OAuth `state` is signed and bound to the browser by a
+  short-lived cookie, and it can only return to a `/<namespace>/…` path.
 
 ## HTTP API
 
@@ -56,6 +68,7 @@ This is the same design as the personal data warehouse:
 AUTH="Authorization: Bearer laptop:$MCP_SECRET"
 curl -H "$AUTH" -F file=@photo.jpg https://files.zachlatta.com/api/files             # upload
 curl -H "$AUTH" --data-binary @notes.md "https://files.zachlatta.com/api/files?name=notes.md&namespace=<uuid>&password=pw"
+curl -H "$AUTH" -F file=@plan.pdf --form-string emails=zach@hackclub.com,@hackclub.com https://files.zachlatta.com/api/files  # share with people
 curl -H "$AUTH" -X PUT --data-binary @v2.jpg https://files.zachlatta.com/api/files/<id>/content   # replace
 curl -H "$AUTH" "https://files.zachlatta.com/api/files?q=photo&deleted=false"         # list
 curl -H "$AUTH" -X DELETE https://files.zachlatta.com/api/files/<id>                  # delete
@@ -98,6 +111,8 @@ signed upload URL for anything larger.
 | `RETENTION_DAYS` | `30` | How long deleted files and replaced versions are kept |
 | `MAX_UPLOAD_MB` | `5120` | Per-file limit |
 | `SOURCE_COMMIT` | `dev` | Version on `/healthz` (Coolify sets it) |
+| `HCA_CLIENT_ID`, `HCA_CLIENT_SECRET` | unset (email restriction off) | Hack Club Auth app credentials; its redirect URI must be `PUBLIC_URL/oauth/callback` |
+| `HCA_URL` | `https://auth.hackclub.com` | Hack Club Auth origin |
 
 `source_url` uploads refuse private, loopback, link-local and CGNAT/tailnet addresses, so a
 public file can never be made from something only the server can reach.

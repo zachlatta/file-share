@@ -326,3 +326,43 @@ func TestSignedDownloadURLs(t *testing.T) {
 		t.Fatal("expired download grant accepted")
 	}
 }
+
+func TestLoginState(t *testing.T) {
+	s, _, c := newTestService(t)
+	state := s.SignLoginState(LoginState{Next: "/ns/a.txt", Nonce: "n1"}, 10*time.Minute)
+	got, err := s.VerifyLoginState(state)
+	if err != nil || got.Next != "/ns/a.txt" || got.Nonce != "n1" {
+		t.Fatalf("verify state: %+v %v", got, err)
+	}
+	if _, err := s.VerifyDownload(state); err == nil {
+		t.Fatal("login state accepted as a download token")
+	}
+	if _, err := s.VerifyEmailSession(state, "ns"); err == nil {
+		t.Fatal("login state accepted as an email session")
+	}
+	c.t = c.t.Add(11 * time.Minute)
+	if _, err := s.VerifyLoginState(state); err == nil {
+		t.Fatal("expired login state accepted")
+	}
+}
+
+func TestEmailSession(t *testing.T) {
+	s, _, c := newTestService(t)
+	session := s.SignEmailSession("ns-a", "zach@hackclub.com", 24*time.Hour)
+	if email, err := s.VerifyEmailSession(session, "ns-a"); err != nil || email != "zach@hackclub.com" {
+		t.Fatalf("verify session: %q %v", email, err)
+	}
+	if _, err := s.VerifyEmailSession(session, "ns-b"); err == nil {
+		t.Fatal("session for one namespace accepted in another")
+	}
+	if _, err := s.VerifyEmailSession(session+"x", "ns-a"); err == nil {
+		t.Fatal("tampered session accepted")
+	}
+	if _, err := s.VerifyLoginState(session); err == nil {
+		t.Fatal("email session accepted as login state")
+	}
+	c.t = c.t.Add(25 * time.Hour)
+	if _, err := s.VerifyEmailSession(session, "ns-a"); err == nil {
+		t.Fatal("expired session accepted")
+	}
+}

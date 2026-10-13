@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -44,7 +45,10 @@ type Config struct {
 	Retention time.Duration
 	// MaxBytes caps a single upload. Zero means no limit.
 	MaxBytes int64
-	Now      func() time.Time
+	// EmailLogin reports that visitors can sign in with Hack Club Auth.
+	// Without it, files cannot be restricted to email addresses.
+	EmailLogin bool
+	Now        func() time.Time
 }
 
 type Service struct {
@@ -53,23 +57,27 @@ type Service struct {
 	baseURL   string
 	retention time.Duration
 	maxBytes  int64
+	emailAuth bool
 	now       func() time.Time
 }
 
 // File is a file's current state. Times are UTC.
 type File struct {
-	ID          string     `json:"id"`
-	Namespace   string     `json:"namespace"`
-	Name        string     `json:"name"`
-	URL         string     `json:"url"`
-	Size        int64      `json:"size"`
-	ContentType string     `json:"content_type"`
-	SHA256      string     `json:"sha256"`
-	Version     int        `json:"version"`
-	HasPassword bool       `json:"has_password"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
+	ID          string `json:"id"`
+	Namespace   string `json:"namespace"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"content_type"`
+	SHA256      string `json:"sha256"`
+	Version     int    `json:"version"`
+	HasPassword bool   `json:"has_password"`
+	// AllowedEmails lists who may open the file after signing in with Hack
+	// Club Auth: exact addresses, or "@domain" for a whole domain.
+	AllowedEmails []string   `json:"allowed_emails,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	DeletedAt     *time.Time `json:"deleted_at,omitempty"`
 	// PurgeAt is when a deleted file will be permanently removed.
 	PurgeAt *time.Time `json:"purge_at,omitempty"`
 
@@ -114,7 +122,7 @@ func Open(ctx context.Context, cfg Config) (*Service, error) {
 	}
 	return &Service{
 		db: pool, blobs: cfg.Blobs, baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		retention: cfg.Retention, maxBytes: cfg.MaxBytes, now: cfg.Now,
+		retention: cfg.Retention, maxBytes: cfg.MaxBytes, emailAuth: cfg.EmailLogin, now: cfg.Now,
 	}, nil
 }
 
@@ -155,7 +163,10 @@ type UploadInput struct {
 	// Size is the body length, or -1 if unknown.
 	Size     int64
 	Password string
-	Client   string
+	// AllowedEmails restricts the file to these signed-in emails or
+	// "@domain" entries.
+	AllowedEmails []string
+	Client        string
 }
 
 func (s *Service) Upload(ctx context.Context, in UploadInput) (File, error) {
@@ -177,6 +188,10 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (File, error) {
 			return File{}, err
 		}
 	}
+	emails, err := s.cleanEmails(in.AllowedEmails)
+	if err != nil {
+		return File{}, err
+	}
 	if _, err := s.Lookup(ctx, ns, name); err == nil {
 		return File{}, ErrExists
 	} else if !errors.Is(err, ErrNotFound) {
@@ -189,8 +204,8 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (File, error) {
 	now := s.nowUTC()
 	id := uuid.NewString()
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO files (id, namespace, name, password_hash, current_version, created_at, updated_at)
-			VALUES ($1, $2, $3, NULLIF($4, ''), 1, $5, $5)`, id, ns, name, hash, now); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO files (id, namespace, name, password_hash, allowed_emails, current_version, created_at, updated_at)
+			VALUES ($1, $2, $3, NULLIF($4, ''), $5, 1, $6, $6)`, id, ns, name, hash, emails, now); err != nil {
 			return err
 		}
 		return insertVersion(ctx, tx, id, 1, v, now, in.Client, "")
@@ -399,6 +414,85 @@ func (s *Service) SetPassword(ctx context.Context, id, password string) (File, e
 		return File{}, ErrNotFound
 	}
 	return s.Get(ctx, id)
+}
+
+// SetAllowedEmails replaces the list of emails (or "@domain" entries) that
+// may open a file after signing in. An empty list removes the restriction.
+func (s *Service) SetAllowedEmails(ctx context.Context, id string, emails []string) (File, error) {
+	clean, err := s.cleanEmails(emails)
+	if err != nil {
+		return File{}, err
+	}
+	tag, err := s.db.Exec(ctx, `UPDATE files SET allowed_emails = $2, updated_at = $3 WHERE id = $1`, id, clean, s.nowUTC())
+	if err != nil {
+		return File{}, notFound(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return File{}, ErrNotFound
+	}
+	return s.Get(ctx, id)
+}
+
+func (s *Service) cleanEmails(emails []string) ([]string, error) {
+	clean := []string{}
+	for _, e := range emails {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" {
+			continue
+		}
+		if !validEmailEntry(e) {
+			return nil, fmt.Errorf("%w: %q is not an email address or @domain", ErrInvalid, e)
+		}
+		if !slices.Contains(clean, e) {
+			clean = append(clean, e)
+		}
+	}
+	if len(clean) > 0 && !s.emailAuth {
+		return nil, fmt.Errorf("%w: email restrictions need Hack Club Auth; set HCA_CLIENT_ID and HCA_CLIENT_SECRET", ErrInvalid)
+	}
+	slices.Sort(clean)
+	return clean, nil
+}
+
+// validEmailEntry accepts a lowercase "local@domain" or "@domain", where the
+// domain has a dot and no empty labels.
+func validEmailEntry(e string) bool {
+	if len(e) > 254 {
+		return false
+	}
+	_, domain, ok := strings.Cut(e, "@")
+	if !ok || strings.Contains(domain, "@") || len(domain) < 3 || !strings.Contains(domain, ".") {
+		return false
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" {
+			return false
+		}
+	}
+	for _, r := range e {
+		if r <= ' ' || r == 0x7f || strings.ContainsRune(`<>()[]\,;:"`, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// Restricted reports whether visitors need a password or a sign-in.
+func (f File) Restricted() bool { return f.HasPassword || len(f.AllowedEmails) > 0 }
+
+// AllowsEmail reports whether a signed-in, verified email may open f.
+func (f File) AllowsEmail(email string) bool {
+	email = strings.ToLower(strings.TrimSpace(email))
+	_, domain, ok := strings.Cut(email, "@")
+	if !ok || domain == "" {
+		return false
+	}
+	for _, allowed := range f.AllowedEmails {
+		if allowed == email || allowed == "@"+domain {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckPassword reports whether password opens f. Files without a password

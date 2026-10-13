@@ -15,6 +15,7 @@ import (
 	"github.com/zachlatta/file-share/internal/config"
 	"github.com/zachlatta/file-share/internal/fetch"
 	"github.com/zachlatta/file-share/internal/files"
+	"github.com/zachlatta/file-share/internal/hcauth"
 	"github.com/zachlatta/file-share/internal/mcpserver"
 	"github.com/zachlatta/file-share/internal/web"
 )
@@ -45,9 +46,13 @@ func New(ctx context.Context, cfg config.Config, opts Options) (*App, error) {
 		}
 		blobs = s3
 	}
+	var hca *hcauth.Client
+	if cfg.HCAClientID != "" {
+		hca = hcauth.New(hcauth.Config{ClientID: cfg.HCAClientID, ClientSecret: cfg.HCAClientSecret, BaseURL: cfg.HCAURL, RedirectURL: cfg.PublicURL + "/oauth/callback"})
+	}
 	svc, err := files.Open(ctx, files.Config{
 		DatabaseURL: cfg.DatabaseURL, Blobs: blobs, BaseURL: cfg.PublicURL,
-		Retention: cfg.Retention, MaxBytes: cfg.MaxUploadBytes,
+		Retention: cfg.Retention, MaxBytes: cfg.MaxUploadBytes, EmailLogin: hca != nil,
 	})
 	if err != nil {
 		return nil, err
@@ -56,7 +61,7 @@ func New(ctx context.Context, cfg config.Config, opts Options) (*App, error) {
 
 	mux := http.NewServeMux()
 	authService.RegisterHandlers(mux)
-	web.New(web.Config{Files: svc, Auth: authService, Version: cfg.Version}).Register(mux)
+	web.New(web.Config{Files: svc, Auth: authService, HCA: hca, Version: cfg.Version}).Register(mux)
 
 	mcpServer := mcpserver.New(mcpserver.Config{Files: svc, Auth: authService, Fetcher: fetch.New(fetch.Options{}), Version: cfg.Version})
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})

@@ -38,6 +38,7 @@ func newHarness(t *testing.T) *harness {
 		BaseURL:     "https://files.example.com",
 		Retention:   30 * 24 * time.Hour,
 		MaxBytes:    1 << 20,
+		EmailLogin:  true,
 		Now:         c.now,
 	})
 	if err != nil {
@@ -310,6 +311,57 @@ func TestPasswords(t *testing.T) {
 	f, _ = h.svc.Replace(ctx, f.ID, ReplaceInput{Body: strings.NewReader("v2"), Size: -1})
 	if !f.HasPassword {
 		t.Fatal("replace dropped password")
+	}
+}
+
+func TestAllowedEmails(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	f, err := h.svc.Upload(ctx, UploadInput{Name: "plan.pdf", Body: strings.NewReader("x"), Size: -1,
+		AllowedEmails: []string{" Zach@HackClub.com", "@Example.org", "zach@hackclub.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.AllowedEmails, []string{"@example.org", "zach@hackclub.com"}) || !f.Restricted() {
+		t.Fatalf("allowed emails = %q", f.AllowedEmails)
+	}
+	for email, want := range map[string]bool{
+		"zach@hackclub.com": true, "ZACH@hackclub.com": true, "anyone@example.org": true,
+		"other@hackclub.com": false, "x@sub.example.org": false, "x@notexample.org": false, "": false,
+	} {
+		if got := f.AllowsEmail(email); got != want {
+			t.Errorf("AllowsEmail(%q) = %v, want %v", email, got, want)
+		}
+	}
+	// Restrictions survive replace and are visible on reload.
+	f, _ = h.svc.Replace(ctx, f.ID, ReplaceInput{Body: strings.NewReader("v2"), Size: -1})
+	if len(f.AllowedEmails) != 2 {
+		t.Fatalf("replace dropped emails: %q", f.AllowedEmails)
+	}
+	f, err = h.svc.SetAllowedEmails(ctx, f.ID, []string{"friend@gmail.com"})
+	if err != nil || !slices.Equal(f.AllowedEmails, []string{"friend@gmail.com"}) || f.AllowsEmail("zach@hackclub.com") {
+		t.Fatalf("set emails: %q %v", f.AllowedEmails, err)
+	}
+	f, err = h.svc.SetAllowedEmails(ctx, f.ID, nil)
+	if err != nil || len(f.AllowedEmails) != 0 || f.Restricted() || f.AllowsEmail("friend@gmail.com") {
+		t.Fatalf("clear emails: %q %v", f.AllowedEmails, err)
+	}
+	for _, bad := range []string{"not-an-email", "a@b", "two@@x.com", "sp ace@x.com", "@", "a@.com", "<a@b.com>"} {
+		if _, err := h.svc.SetAllowedEmails(ctx, f.ID, []string{bad}); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%q accepted: %v", bad, err)
+		}
+	}
+}
+
+func TestAllowedEmailsNeedEmailLogin(t *testing.T) {
+	svc, err := Open(context.Background(), Config{DatabaseURL: pgtest.New(t), Blobs: blob.NewMemory(), BaseURL: "https://files.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(svc.Close)
+	_, err = svc.Upload(context.Background(), UploadInput{Name: "a.txt", Body: strings.NewReader("x"), Size: -1, AllowedEmails: []string{"zach@hackclub.com"}})
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "HCA_CLIENT_ID") {
+		t.Fatalf("upload without email login: %v", err)
 	}
 }
 

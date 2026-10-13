@@ -27,6 +27,11 @@ type Config struct {
 	MaxUploadBytes int64
 	PurgeInterval  time.Duration
 	Version        string
+	// Hack Club Auth sign-in for email-restricted files. Off when the client
+	// ID and secret are unset.
+	HCAClientID     string
+	HCAClientSecret string
+	HCAURL          string
 }
 
 func Load(getenv func(string) string) (Config, error) {
@@ -47,6 +52,10 @@ func Load(getenv func(string) string) (Config, error) {
 		S3Region:      get("S3_REGION", "us-east-1"),
 		PurgeInterval: time.Hour,
 		Version:       get("SOURCE_COMMIT", "dev"),
+
+		HCAClientID:     get("HCA_CLIENT_ID", ""),
+		HCAClientSecret: get("HCA_CLIENT_SECRET", ""),
+		HCAURL:          strings.TrimRight(get("HCA_URL", "https://auth.hackclub.com"), "/"),
 	}
 	cfg.PublicURL = strings.TrimRight(get("PUBLIC_URL", "http://"+cfg.Addr), "/")
 
@@ -61,6 +70,9 @@ func Load(getenv func(string) string) (Config, error) {
 		if value == "" {
 			return Config{}, fmt.Errorf("%s is required", key)
 		}
+	}
+	if (cfg.HCAClientID == "") != (cfg.HCAClientSecret == "") {
+		return Config{}, errors.New("set both HCA_CLIENT_ID and HCA_CLIENT_SECRET, or neither")
 	}
 	days, err := strconv.Atoi(get("RETENTION_DAYS", "30"))
 	if err != nil || days < 1 {

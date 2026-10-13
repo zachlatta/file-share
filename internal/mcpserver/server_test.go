@@ -26,7 +26,7 @@ func connect(t *testing.T) *mcp.ClientSession {
 	t.Helper()
 	svc, err := files.Open(context.Background(), files.Config{
 		DatabaseURL: pgtest.New(t), Blobs: blob.NewMemory(), BaseURL: "https://files.example.com",
-		Retention: 30 * 24 * time.Hour, MaxBytes: 1 << 20,
+		Retention: 30 * 24 * time.Hour, MaxBytes: 1 << 20, EmailLogin: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +92,7 @@ func TestCatalog(t *testing.T) {
 	}
 	for _, want := range []string{"upload_file", "create_upload_url", "replace_file", "read_file", "create_download_url",
 		"get_file", "list_files", "list_versions", "rollback_file", "rename_file", "delete_file", "restore_file",
-		"purge_file", "set_password", "remove_password", "get_stats"} {
+		"purge_file", "set_password", "remove_password", "set_allowed_emails", "get_stats"} {
 		if !slices.Contains(names, want) {
 			t.Errorf("missing tool %s", want)
 		}
@@ -230,5 +230,25 @@ func TestSignedURLsAndSourceURL(t *testing.T) {
 	ok(t, call(t, s, "get_stats", nil), &st)
 	if st.Files != 2 || st.RetentionDays != 30 {
 		t.Fatalf("stats = %+v", st)
+	}
+}
+
+func TestAllowedEmails(t *testing.T) {
+	s := connect(t)
+	var f files.File
+	ok(t, call(t, s, "upload_file", map[string]any{"name": "plan.txt", "content_text": "x", "allowed_emails": []string{"Zach@HackClub.com"}}), &f)
+	if !slices.Equal(f.AllowedEmails, []string{"zach@hackclub.com"}) {
+		t.Fatalf("upload allowed_emails = %q", f.AllowedEmails)
+	}
+	ok(t, call(t, s, "set_allowed_emails", map[string]any{"file": f.URL, "emails": []string{"@hackclub.com", "friend@gmail.com"}}), &f)
+	if !slices.Equal(f.AllowedEmails, []string{"@hackclub.com", "friend@gmail.com"}) {
+		t.Fatalf("set_allowed_emails = %q", f.AllowedEmails)
+	}
+	ok(t, call(t, s, "set_allowed_emails", map[string]any{"file": f.ID, "emails": []string{}}), &f)
+	if len(f.AllowedEmails) != 0 {
+		t.Fatalf("clear = %q", f.AllowedEmails)
+	}
+	if res := call(t, s, "set_allowed_emails", map[string]any{"file": f.ID, "emails": []string{"nope"}}); !res.IsError {
+		t.Fatal("invalid email accepted")
 	}
 }

@@ -21,14 +21,14 @@ import (
 )
 
 const fileColumns = `f.id::text, f.namespace::text, f.name, COALESCE(f.password_hash, ''), f.current_version,
-	f.created_at, f.updated_at, f.deleted_at, v.size, v.content_type, v.sha256`
+	f.created_at, f.updated_at, f.deleted_at, v.size, v.content_type, v.sha256, f.allowed_emails`
 
 const fileFrom = ` FROM files f JOIN versions v ON v.file_id = f.id AND v.number = f.current_version`
 
 func (s *Service) scanFile(row pgx.Row) (File, error) {
 	var f File
 	err := row.Scan(&f.ID, &f.Namespace, &f.Name, &f.passwordHash, &f.Version,
-		&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.Size, &f.ContentType, &f.SHA256)
+		&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.Size, &f.ContentType, &f.SHA256, &f.AllowedEmails)
 	if err != nil {
 		return File{}, notFound(err)
 	}
@@ -41,6 +41,9 @@ func (s *Service) decorate(f *File) {
 	f.UpdatedAt = f.UpdatedAt.UTC()
 	f.URL = s.URLFor(f.Namespace, f.Name)
 	f.HasPassword = f.passwordHash != ""
+	if len(f.AllowedEmails) == 0 {
+		f.AllowedEmails = nil
+	}
 	if f.HasPassword {
 		sum := sha256.Sum256([]byte(f.passwordHash))
 		f.PasswordStamp = hex.EncodeToString(sum[:8])

@@ -17,6 +17,7 @@ import (
 	"github.com/zachlatta/file-share/internal/auth"
 	"github.com/zachlatta/file-share/internal/blob"
 	"github.com/zachlatta/file-share/internal/files"
+	"github.com/zachlatta/file-share/internal/hcauth"
 	"github.com/zachlatta/file-share/internal/pgtest"
 )
 
@@ -32,9 +33,15 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
+	return newEnvWith(t, nil)
+}
+
+// newEnvWith builds a handler; hca, if set, enables Hack Club Auth sign-in.
+func newEnvWith(t *testing.T, hca *hcauth.Client) *env {
+	t.Helper()
 	svc, err := files.Open(context.Background(), files.Config{
 		DatabaseURL: pgtest.New(t), Blobs: blob.NewMemory(), BaseURL: "https://files.example.com",
-		Retention: 30 * 24 * time.Hour, MaxBytes: 1 << 20,
+		Retention: 30 * 24 * time.Hour, MaxBytes: 1 << 20, EmailLogin: hca != nil,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +49,7 @@ func newEnv(t *testing.T) *env {
 	t.Cleanup(svc.Close)
 	a := auth.NewService(auth.Config{Secret: secret, BaseURL: "https://files.example.com"})
 	mux := http.NewServeMux()
-	New(Config{Files: svc, Auth: a, Version: "test"}).Register(mux)
+	New(Config{Files: svc, Auth: a, HCA: hca, Version: "test"}).Register(mux)
 	return &env{files: svc, auth: a, handler: mux}
 }
 

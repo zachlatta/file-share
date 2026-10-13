@@ -39,6 +39,9 @@ var migrations = []string{
 	);
 	CREATE INDEX versions_blob ON versions (blob_key);
 	CREATE INDEX versions_superseded ON versions (superseded_at) WHERE superseded_at IS NOT NULL;`,
+	// Emails (or "@domain" entries) allowed to open a file after signing in
+	// with Hack Club Auth. Empty means no email restriction.
+	`ALTER TABLE files ADD COLUMN allowed_emails text[] NOT NULL DEFAULT '{}';`,
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {

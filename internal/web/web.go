@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
 	"mime"
 	"net/http"
@@ -23,23 +22,28 @@ import (
 	"github.com/google/uuid"
 	"github.com/zachlatta/file-share/internal/auth"
 	"github.com/zachlatta/file-share/internal/files"
+	"github.com/zachlatta/file-share/internal/hcauth"
 )
 
 type Config struct {
-	Files   *files.Service
-	Auth    *auth.Service
+	Files *files.Service
+	Auth  *auth.Service
+	// HCA enables "Sign in with Hack Club" for email-restricted files. Nil
+	// disables it.
+	HCA     *hcauth.Client
 	Version string
 }
 
 type Handler struct {
 	files   *files.Service
 	auth    *auth.Service
+	hca     *hcauth.Client
 	version string
 	secure  bool
 }
 
 func New(cfg Config) *Handler {
-	return &Handler{files: cfg.Files, auth: cfg.Auth, version: cfg.Version, secure: strings.HasPrefix(cfg.Files.BaseURL(), "https://")}
+	return &Handler{files: cfg.Files, auth: cfg.Auth, hca: cfg.HCA, version: cfg.Version, secure: strings.HasPrefix(cfg.Files.BaseURL(), "https://")}
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -58,6 +62,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /upload/{token}", h.signedUpload)
 	mux.HandleFunc("POST /upload/{token}", h.signedUpload)
 	mux.HandleFunc("GET /download/{token}", h.signedDownload)
+
+	mux.HandleFunc("GET /oauth/hackclub", h.loginStart)
+	mux.HandleFunc("GET /oauth/callback", h.loginCallback)
 
 	mux.HandleFunc("GET /{ns}/{name...}", h.serve)
 	mux.HandleFunc("POST /{ns}/{name...}", h.unlock)
@@ -105,8 +112,8 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		h.notFound(w, r, err)
 		return
 	}
-	if f.HasPassword && !h.unlocked(r, f) {
-		renderPassword(w, http.StatusUnauthorized, f, "")
+	if f.Restricted() && !h.unlocked(r, f) {
+		h.renderGate(w, r, f, "")
 		return
 	}
 	h.send(w, r, f, 0)
@@ -126,7 +133,7 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 	}
 	if !h.files.CheckPassword(f, r.PostFormValue("password")) {
 		time.Sleep(250 * time.Millisecond) // blunt online guessing
-		renderPassword(w, http.StatusUnauthorized, f, "Wrong password.")
+		h.renderGate(w, r, f, "Wrong password.")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -139,7 +146,15 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 
 func cookieName(fileID string) string { return "fsp_" + strings.ReplaceAll(fileID, "-", "") }
 
+// unlocked reports whether the request may open a restricted file: by the
+// file's password, or by a signed-in email the file allows.
 func (h *Handler) unlocked(r *http.Request, f files.File) bool {
+	if len(f.AllowedEmails) > 0 && f.AllowsEmail(h.sessionEmail(r, f.Namespace)) {
+		return true
+	}
+	if !f.HasPassword {
+		return false
+	}
 	if c, err := r.Cookie(cookieName(f.ID)); err == nil && c.Value == h.auth.MAC("file-password", f.ID, f.PasswordStamp) {
 		return true
 	}
@@ -170,7 +185,7 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request, f files.File, ver
 		disposition = "attachment"
 	}
 	header.Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": path.Base(f.Name)}))
-	if f.HasPassword || version != 0 {
+	if f.Restricted() || version != 0 {
 		header.Set("Cache-Control", "private, no-cache")
 	} else {
 		header.Set("Cache-Control", "public, max-age=60, must-revalidate")
@@ -202,12 +217,19 @@ func (h *Handler) signedDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 // upload is an incoming file from either a multipart form (field "file",
-// plus optional fields name, namespace, password) or a raw body (with query
-// parameters name, namespace, password and the Content-Type header).
+// plus optional fields name, namespace, password, emails) or a raw body (with
+// query parameters name, namespace, password, emails and the Content-Type
+// header). emails is a comma-separated list of addresses or @domains.
 type upload struct {
 	name, namespace, password, contentType string
+	emails                                 []string
 	body                                   io.Reader
 	size                                   int64
+}
+
+// splitEmails reads a comma- or space-separated list of emails.
+func splitEmails(value string) []string {
+	return strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' || r == '\t' })
 }
 
 // readUpload calls fn with the upload. A raw body is streamed straight
@@ -215,7 +237,7 @@ type upload struct {
 // upload limit) so that fields sent after it, as curl -F does, still apply.
 func (h *Handler) readUpload(r *http.Request, fn func(upload) (files.File, error)) (files.File, error) {
 	q := r.URL.Query()
-	u := upload{name: q.Get("name"), namespace: q.Get("namespace"), password: q.Get("password")}
+	u := upload{name: q.Get("name"), namespace: q.Get("namespace"), password: q.Get("password"), emails: splitEmails(q.Get("emails"))}
 	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if mediaType != "multipart/form-data" {
 		u.contentType = r.Header.Get("Content-Type")
@@ -280,6 +302,8 @@ func (h *Handler) readUpload(r *http.Request, fn func(upload) (files.File, error
 			u.namespace = string(value)
 		case "password":
 			u.password = string(value)
+		case "emails":
+			u.emails = splitEmails(string(value))
 		}
 	}
 	if spool == nil {
@@ -302,7 +326,7 @@ func (h *Handler) create(r *http.Request, client, namespace, name string) (files
 		}
 		return h.files.Upload(r.Context(), files.UploadInput{
 			Namespace: u.namespace, Name: u.name, ContentType: u.contentType,
-			Body: u.body, Size: u.size, Password: u.password, Client: client,
+			Body: u.body, Size: u.size, Password: u.password, AllowedEmails: u.emails, Client: client,
 		})
 	})
 }
@@ -437,18 +461,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-
-func renderPassword(w http.ResponseWriter, status int, f files.File, message string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "private, no-store")
-	w.Header().Set("X-Frame-Options", "DENY")
-	w.WriteHeader(status)
-	_ = passwordPage.Execute(w, map[string]string{"Name": path.Base(f.Name), "Error": message})
-}
-
-var passwordPage = template.Must(template.New("password").Parse(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Password required</title>
-<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:28rem;margin:15vh auto;padding:0 1rem;color:#172026}input{display:block;width:100%;box-sizing:border-box;margin:.5rem 0 1rem;padding:.7rem;font:inherit;border:1px solid #b8c1cc;border-radius:6px}button{padding:.7rem 1rem;font:inherit;border:0;border-radius:6px;background:#172026;color:#fff;cursor:pointer}.error{color:#a00}</style></head>
-<body><h1>🔒 {{.Name}}</h1><p>This file is password protected.</p>
-{{with .Error}}<p class="error">{{.}}</p>{{end}}
-<form method="post"><label for="password">Password</label><input id="password" name="password" type="password" autofocus required autocomplete="current-password"><button type="submit">Open</button></form></body></html>`))

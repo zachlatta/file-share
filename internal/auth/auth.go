@@ -67,6 +67,8 @@ type signedPayload struct {
 	Filename     string   `json:"filename,omitempty"`
 	FileID       string   `json:"file_id,omitempty"`
 	Version      int      `json:"version,omitempty"`
+	Next         string   `json:"next,omitempty"`
+	Email        string   `json:"email,omitempty"`
 	Nonce        string   `json:"nonce,omitempty"`
 	Exp          int64    `json:"exp,omitempty"`
 	Iat          int64    `json:"iat,omitempty"`
@@ -419,6 +421,53 @@ func (s *Service) VerifyDownload(token string) (DownloadGrant, error) {
 		return DownloadGrant{}, errors.New("download URL expired")
 	}
 	return DownloadGrant{FileID: p.FileID, Version: p.Version}, nil
+}
+
+// LoginState is the OAuth state for a Hack Club Auth sign-in. Next is the
+// local path to return to. Nonce is also kept in a short-lived cookie, so a
+// callback only completes in the browser that started it.
+type LoginState struct {
+	Next  string
+	Nonce string
+}
+
+func (s *Service) SignLoginState(st LoginState, ttl time.Duration) string {
+	token, _ := s.sign(signedPayload{Type: "login_state", Next: st.Next, Nonce: st.Nonce, Exp: s.now().Add(ttl).Unix(), Iat: s.now().Unix()})
+	return token
+}
+
+func (s *Service) VerifyLoginState(token string) (LoginState, error) {
+	var p signedPayload
+	if err := s.verify(token, "login_state", &p); err != nil {
+		return LoginState{}, err
+	}
+	if s.now().Unix() > p.Exp {
+		return LoginState{}, errors.New("sign-in took too long; try again")
+	}
+	return LoginState{Next: p.Next, Nonce: p.Nonce}, nil
+}
+
+// SignEmailSession records that a visitor proved, through Hack Club Auth,
+// that they own email. It is valid only for one namespace; each file still
+// checks the email against its own allow list on every request.
+func (s *Service) SignEmailSession(namespace, email string, ttl time.Duration) string {
+	token, _ := s.sign(signedPayload{Type: "email_session", Namespace: namespace, Email: email, Nonce: nonce(), Exp: s.now().Add(ttl).Unix(), Iat: s.now().Unix()})
+	return token
+}
+
+// VerifyEmailSession returns the signed-in email for namespace.
+func (s *Service) VerifyEmailSession(token, namespace string) (string, error) {
+	var p signedPayload
+	if err := s.verify(token, "email_session", &p); err != nil {
+		return "", err
+	}
+	if s.now().Unix() > p.Exp {
+		return "", errors.New("session expired")
+	}
+	if p.Namespace != namespace || p.Email == "" {
+		return "", errors.New("session is for another namespace")
+	}
+	return p.Email, nil
 }
 
 // MAC returns an HMAC of parts under the secret, for callers that need their

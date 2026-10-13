@@ -168,3 +168,29 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("api list = %d", len(list.Files))
 	}
 }
+
+func TestHackClubAuthWiring(t *testing.T) {
+	server := httptest.NewServer(nil)
+	t.Cleanup(server.Close)
+	cfg := config.Config{
+		Secret: secret, PublicURL: server.URL, DatabaseURL: pgtest.New(t),
+		Retention: 30 * 24 * time.Hour, MaxUploadBytes: 10 << 20, PurgeInterval: time.Hour, Version: "test",
+		HCAClientID: "cid", HCAClientSecret: "csecret", HCAURL: "https://auth.hackclub.com",
+	}
+	app, err := New(context.Background(), cfg, Options{Blobs: blob.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(app.Close)
+	next := "/00000000-0000-4000-8000-000000000000/a.txt"
+	rec := httptest.NewRecorder()
+	app.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/hackclub?next="+url.QueryEscape(next), nil))
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	if rec.Code != http.StatusFound || loc.Host != "auth.hackclub.com" || loc.Query().Get("client_id") != "cid" ||
+		loc.Query().Get("redirect_uri") != server.URL+"/oauth/callback" {
+		t.Fatalf("login start: %d %s", rec.Code, loc)
+	}
+	if strings.Contains(loc.String(), "csecret") {
+		t.Fatal("client secret leaked into the authorize URL")
+	}
+}

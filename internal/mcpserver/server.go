@@ -49,9 +49,10 @@ type ContentInput struct {
 }
 
 type UploadInput struct {
-	Name      string `json:"name,omitempty" jsonschema:"File name, which becomes the last part of the URL. May contain '/' to make folders. Defaults to the source_url's file name."`
-	Namespace string `json:"namespace,omitempty" jsonschema:"Existing namespace UUID to add this file to (to group files, e.g. a small website). Omit to create a new unguessable namespace."`
-	Password  string `json:"password,omitempty" jsonschema:"Optional password visitors must enter to open the file."`
+	Name          string   `json:"name,omitempty" jsonschema:"File name, which becomes the last part of the URL. May contain '/' to make folders. Defaults to the source_url's file name."`
+	Namespace     string   `json:"namespace,omitempty" jsonschema:"Existing namespace UUID to add this file to (to group files, e.g. a small website). Omit to create a new unguessable namespace."`
+	Password      string   `json:"password,omitempty" jsonschema:"Optional password visitors must enter to open the file."`
+	AllowedEmails []string `json:"allowed_emails,omitempty" jsonschema:"Optional: only these people can open the file, after signing in with Hack Club Auth. Exact addresses, or '@domain.com' for a whole domain. Preferred over a password for sharing with specific people."`
 	ContentInput
 }
 
@@ -91,6 +92,11 @@ type RenameInput struct {
 type PasswordInput struct {
 	File     string `json:"file" jsonschema:"The file: its ID, its public URL, or namespace/name."`
 	Password string `json:"password" jsonschema:"The new password (max 72 bytes)."`
+}
+
+type EmailsInput struct {
+	File   string   `json:"file" jsonschema:"The file: its ID, its public URL, or namespace/name."`
+	Emails []string `json:"emails" jsonschema:"The complete new list: email addresses, or '@domain.com' for a whole domain. An empty list removes the email restriction."`
 }
 
 type PurgeInput struct {
@@ -167,7 +173,9 @@ func New(cfg Config) *mcp.Server {
 	days := int(cfg.Files.Retention().Hours() / 24)
 	srv := mcp.NewServer(&mcp.Implementation{Name: "file-share", Title: "file-share", Version: cfg.Version}, &mcp.ServerOptions{
 		Instructions: fmt.Sprintf("A personal file host at %s. Every file gets a public URL of the form %s/<namespace-uuid>/<name>; "+
-			"namespaces are random UUIDs, so URLs are unguessable but anyone with the link can open the file unless it has a password. "+
+			"namespaces are random UUIDs, so URLs are unguessable but anyone with the link can open the file unless it is restricted. "+
+			"To share with specific people, set allowed_emails (or call set_allowed_emails): visitors sign in with Hack Club Auth and only those emails (or '@domain' entries) can open the file. "+
+			"A password is the alternative for people without a Hack Club account; if a file has both, either one opens it. "+
 			"Upload small files inline (content_text or content_base64), from the web (source_url), or for large or local files call create_upload_url and PUT the bytes with curl. "+
 			"Replacing a file keeps its URL and adds a version. Deleted files and replaced versions are kept for %d days, "+
 			"during which restore_file and rollback_file can bring them back; after that they are purged. "+
@@ -180,11 +188,11 @@ func New(cfg Config) *mcp.Server {
 	updating := &mcp.ToolAnnotations{DestructiveHint: ptr(true), IdempotentHint: true, OpenWorldHint: &closed}
 	destructive := &mcp.ToolAnnotations{DestructiveHint: ptr(true), OpenWorldHint: &closed}
 
-	add(srv, "upload_file", "Upload a new file and get its public URL. Give exactly one of content_text, content_base64 or source_url. Omit namespace for a fresh unguessable URL; pass a namespace to group files. Optionally set a password.", fetching, s.upload)
+	add(srv, "upload_file", "Upload a new file and get its public URL. Give exactly one of content_text, content_base64 or source_url. Omit namespace for a fresh unguessable URL; pass a namespace to group files. Optionally restrict it to allowed_emails (sign in with Hack Club) or a password.", fetching, s.upload)
 	add(srv, "create_upload_url", "Get a short-lived URL that accepts the file bytes over HTTP, for files too large to send inline. Files up to 95 MB: run the returned curl (PUT raw body). Larger files: run curl_chunked, which PUTs 90 MB parts with ?part=N and then POSTs ?complete=N. Pass file to replace an existing file instead.", additive, s.uploadURL)
 	add(srv, "replace_file", "Replace a file's content, keeping its URL and password. The previous content stays available as an older version for the retention window. Give exactly one of content_text, content_base64 or source_url.", fetching, s.replace)
 	mcp.AddTool(srv, &mcp.Tool{Name: "read_file", Description: "Read a file's content (current or an older version). Text comes back as text, other files as base64; images are also returned as images.", Annotations: readOnly}, s.read)
-	add(srv, "create_download_url", "Get a short-lived private URL for the exact bytes of a version of a file. It works even for password-protected or deleted files.", readOnly, s.downloadURL)
+	add(srv, "create_download_url", "Get a short-lived private URL for the exact bytes of a version of a file. It works even for restricted (password or email) or deleted files.", readOnly, s.downloadURL)
 	add(srv, "get_file", "Get a file's details, including its version history.", readOnly, s.get)
 	add(srv, "list_files", "List files, most recently changed first. Set deleted=true to list deleted files that can still be restored.", readOnly, s.list)
 	add(srv, "list_versions", "List a file's retained versions, newest first, with when each will be purged.", readOnly, s.versions)
@@ -195,6 +203,7 @@ func New(cfg Config) *mcp.Server {
 	add(srv, "purge_file", "Permanently and immediately destroy a file and all its versions (for example something uploaded by mistake). Irreversible; requires confirm=true.", destructive, s.purge)
 	add(srv, "set_password", "Set or change the password visitors must enter to open a file. Old unlock cookies stop working.", updating, s.setPassword)
 	add(srv, "remove_password", "Remove a file's password so anyone with the link can open it.", updating, s.removePassword)
+	add(srv, "set_allowed_emails", "Set exactly who can open a file: visitors sign in with Hack Club Auth and must use one of these emails (or match an '@domain' entry). Replaces the whole list; an empty list removes the restriction. Takes effect immediately, including for people already signed in.", updating, s.setAllowedEmails)
 	add(srv, "get_stats", "Totals (files, bytes, deleted files, namespaces), the retention window, and the upload size limit.", readOnly, s.stats)
 	return srv
 }
@@ -262,7 +271,7 @@ func (s *server) upload(ctx context.Context, in UploadInput) (files.File, error)
 	}
 	return s.files.Upload(ctx, files.UploadInput{
 		Namespace: in.Namespace, Name: name, ContentType: contentType, Body: body, Size: size,
-		Password: in.Password, Client: client(ctx),
+		Password: in.Password, AllowedEmails: in.AllowedEmails, Client: client(ctx),
 	})
 }
 
@@ -438,6 +447,10 @@ func (s *server) setPassword(ctx context.Context, in PasswordInput) (files.File,
 
 func (s *server) removePassword(ctx context.Context, in FileInput) (files.File, error) {
 	return s.withFile(ctx, in.File, func(f files.File) (files.File, error) { return s.files.SetPassword(ctx, f.ID, "") })
+}
+
+func (s *server) setAllowedEmails(ctx context.Context, in EmailsInput) (files.File, error) {
+	return s.withFile(ctx, in.File, func(f files.File) (files.File, error) { return s.files.SetAllowedEmails(ctx, f.ID, in.Emails) })
 }
 
 func (s *server) purge(ctx context.Context, in PurgeInput) (okOutput, error) {
