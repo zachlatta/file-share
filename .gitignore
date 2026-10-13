@@ -1,0 +1,4 @@
+/file-share
+.env
+.env.*
+!.env.example
