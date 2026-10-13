@@ -32,6 +32,12 @@ type Config struct {
 	HCAClientID     string
 	HCAClientSecret string
 	HCAURL          string
+	// AdminToken unlocks the /admin audit dashboard. Empty disables it.
+	AdminToken string
+	// ClientIPHeader names a header set by the trusted reverse proxy that
+	// carries the visitor's IP (e.g. CF-Connecting-IP). Empty means the
+	// socket address.
+	ClientIPHeader string
 }
 
 func Load(getenv func(string) string) (Config, error) {
@@ -56,6 +62,8 @@ func Load(getenv func(string) string) (Config, error) {
 		HCAClientID:     get("HCA_CLIENT_ID", ""),
 		HCAClientSecret: get("HCA_CLIENT_SECRET", ""),
 		HCAURL:          strings.TrimRight(get("HCA_URL", "https://auth.hackclub.com"), "/"),
+		AdminToken:      get("ADMIN_TOKEN", ""),
+		ClientIPHeader:  get("CLIENT_IP_HEADER", ""),
 	}
 	cfg.PublicURL = strings.TrimRight(get("PUBLIC_URL", "http://"+cfg.Addr), "/")
 
@@ -73,6 +81,12 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if (cfg.HCAClientID == "") != (cfg.HCAClientSecret == "") {
 		return Config{}, errors.New("set both HCA_CLIENT_ID and HCA_CLIENT_SECRET, or neither")
+	}
+	if cfg.AdminToken != "" && len(cfg.AdminToken) < minSecretLength {
+		return Config{}, fmt.Errorf("ADMIN_TOKEN must be at least %d characters", minSecretLength)
+	}
+	if cfg.AdminToken != "" && cfg.AdminToken == cfg.Secret {
+		return Config{}, errors.New("ADMIN_TOKEN must differ from MCP_SECRET")
 	}
 	days, err := strconv.Atoi(get("RETENTION_DAYS", "30"))
 	if err != nil || days < 1 {

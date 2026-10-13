@@ -21,9 +21,11 @@
   that reveals namespaces or names without auth.
 - Auth stays stateless and HMAC-signed with `MCP_SECRET`. Every token type carries a distinct
   `type`, and verification checks it.
-- Auth must never depend on ambient cookies (uploaded HTML runs on this origin unsandboxed). OAuth uses the typed secret, the API uses bearer tokens, password cookies stay HttpOnly and per-file, and Hack Club sign-in cookies stay HttpOnly, signed and per-namespace, with each file checking its own allow list on every request.
+- Auth must never depend on ambient cookies (uploaded HTML runs on this origin unsandboxed). OAuth uses the typed secret, the API uses bearer tokens, password cookies stay HttpOnly and per-file, and Hack Club sign-in cookies stay HttpOnly, signed and per-namespace, with each file checking its own allow list on every request. The admin dashboard uses a separate `ADMIN_TOKEN` held only in page memory and sent as a bearer header, never a cookie or web storage.
 - `source_url` fetching must keep refusing private, loopback, link-local and CGNAT addresses.
-- Never log query strings, passwords, or `/upload/` and `/download/` tokens.
+- Never log query strings, passwords, or `/upload/` and `/download/` tokens. This includes the
+  access audit log: it records how access was granted, never the secret, and strips query strings
+  from referrers.
 - Migrations are append-only: add a new entry and never edit a shipped one.
 
 ## Public repository safety

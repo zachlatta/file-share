@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>file-share admin</title>
+<link rel="stylesheet" href="/admin/app.css">
+<script src="/admin/app.js" defer></script>
+</head>
+<body>
+<main id="login-view">
+  <h1>file-share admin</h1>
+  <p class="hint">Sign in with the admin token to see who opened protected files.</p>
+  <form id="login-form" autocomplete="on">
+    <input type="text" name="username" value="admin" autocomplete="username" hidden>
+    <label for="token">Admin token</label>
+    <input id="token" name="token" type="password" autocomplete="current-password" required autofocus>
+    <button type="submit">Sign in</button>
+    <p id="login-error" class="error" hidden></p>
+  </form>
+  <p class="hint">The token stays in this page's memory only. Reloading signs you out.</p>
+</main>
+
+<main id="dashboard" hidden>
+  <header>
+    <h1>file-share admin</h1>
+    <button id="refresh" type="button">Refresh</button>
+    <button id="logout" type="button" class="secondary">Sign out</button>
+  </header>
+
+  <section>
+    <h2>Protected files</h2>
+    <div class="scroll"><table id="files-table">
+      <thead><tr><th>File</th><th>Protection</th><th>Views</th><th>Viewers</th><th>Denied</th><th>Last viewed</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <p id="files-empty" class="hint" hidden>No files have a password or allowed emails.</p>
+  </section>
+
+  <section>
+    <h2>Access log</h2>
+    <form id="filters">
+      <select id="event-filter" aria-label="Event">
+        <option value="">All events</option>
+        <option value="view">Views</option>
+        <option value="denied">Denied</option>
+        <option value="wrong_password">Wrong password</option>
+        <option value="unlock">Password unlock</option>
+        <option value="sign_in">Hack Club sign-in</option>
+        <option value="sign_in_failed">Failed sign-in</option>
+      </select>
+      <input id="search" type="search" placeholder="Search email, IP, user agent, file" aria-label="Search">
+      <span id="file-filter" class="chip" hidden><span id="file-filter-name"></span> <button type="button" id="clear-file" aria-label="Clear file filter">×</button></span>
+      <button type="submit">Filter</button>
+    </form>
+    <div class="scroll"><table id="log-table">
+      <thead><tr><th>Time</th><th>Event</th><th>File</th><th>Who</th><th>Via</th><th>IP</th><th>User agent</th><th>Referrer</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <p id="log-empty" class="hint" hidden>No matching events.</p>
+    <button id="more" type="button" class="secondary" hidden>Load more</button>
+  </section>
+</main>
+</body>
+</html>

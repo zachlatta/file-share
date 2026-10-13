@@ -79,3 +79,20 @@ func TestHackClubAuth(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminAndClientIP(t *testing.T) {
+	cfg, err := Load(env(nil))
+	if err != nil || cfg.AdminToken != "" || cfg.ClientIPHeader != "" {
+		t.Fatalf("defaults: %+v %v", cfg, err)
+	}
+	cfg, err = Load(env(map[string]string{"ADMIN_TOKEN": "admin-token-0123456789abcdefgh", "CLIENT_IP_HEADER": "CF-Connecting-IP"}))
+	if err != nil || cfg.AdminToken != "admin-token-0123456789abcdefgh" || cfg.ClientIPHeader != "CF-Connecting-IP" {
+		t.Fatalf("cfg = %+v, %v", cfg, err)
+	}
+	if _, err := Load(env(map[string]string{"ADMIN_TOKEN": "short"})); err == nil || !strings.Contains(err.Error(), "ADMIN_TOKEN") {
+		t.Fatalf("short admin token: %v", err)
+	}
+	if _, err := Load(env(map[string]string{"ADMIN_TOKEN": "0123456789abcdefghijklmnopqrstuv"})); err == nil || !strings.Contains(err.Error(), "ADMIN_TOKEN") {
+		t.Fatalf("admin token equal to MCP_SECRET: %v", err)
+	}
+}

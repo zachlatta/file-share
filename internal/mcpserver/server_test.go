@@ -24,6 +24,12 @@ func TestMain(m *testing.M) { pgtest.Main(m) }
 
 func connect(t *testing.T) *mcp.ClientSession {
 	t.Helper()
+	s, _ := connectWithService(t)
+	return s
+}
+
+func connectWithService(t *testing.T) (*mcp.ClientSession, *files.Service) {
+	t.Helper()
 	svc, err := files.Open(context.Background(), files.Config{
 		DatabaseURL: pgtest.New(t), Blobs: blob.NewMemory(), BaseURL: "https://files.example.com",
 		Retention: 30 * 24 * time.Hour, MaxBytes: 1 << 20, EmailLogin: true,
@@ -43,7 +49,7 @@ func connect(t *testing.T) *mcp.ClientSession {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = session.Close() })
-	return session
+	return session, svc
 }
 
 func call(t *testing.T, s *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
@@ -92,7 +98,7 @@ func TestCatalog(t *testing.T) {
 	}
 	for _, want := range []string{"upload_file", "create_upload_url", "replace_file", "read_file", "create_download_url",
 		"get_file", "list_files", "list_versions", "rollback_file", "rename_file", "delete_file", "restore_file",
-		"purge_file", "set_password", "remove_password", "set_allowed_emails", "get_stats"} {
+		"purge_file", "set_password", "remove_password", "set_allowed_emails", "get_access_log", "get_stats"} {
 		if !slices.Contains(names, want) {
 			t.Errorf("missing tool %s", want)
 		}
@@ -250,5 +256,29 @@ func TestAllowedEmails(t *testing.T) {
 	}
 	if res := call(t, s, "set_allowed_emails", map[string]any{"file": f.ID, "emails": []string{"nope"}}); !res.IsError {
 		t.Fatal("invalid email accepted")
+	}
+}
+
+func TestAccessLogTool(t *testing.T) {
+	s, svc := connectWithService(t)
+	var f files.File
+	ok(t, call(t, s, "upload_file", map[string]any{"name": "plan.txt", "content_text": "x", "password": "pw-123"}), &f)
+	_ = svc.RecordAccess(t.Context(), files.AccessEvent{FileID: f.ID, Name: f.Name, Event: "view", Via: "password_query", IP: "203.0.113.9", UserAgent: "curl/8"})
+	_ = svc.RecordAccess(t.Context(), files.AccessEvent{Event: "denied", IP: "198.51.100.1"})
+	var out struct {
+		Events []files.AccessEvent `json:"events"`
+	}
+	ok(t, call(t, s, "get_access_log", map[string]any{"file": f.URL}), &out)
+	if len(out.Events) != 1 || out.Events[0].IP != "203.0.113.9" || out.Events[0].UserAgent != "curl/8" {
+		t.Fatalf("by file: %+v", out.Events)
+	}
+	ok(t, call(t, s, "purge_file", map[string]any{"file": f.ID, "confirm": true}), &struct{}{})
+	ok(t, call(t, s, "get_access_log", map[string]any{"file": f.ID}), &out)
+	if len(out.Events) != 1 {
+		t.Fatalf("purged file by ID: %+v", out.Events)
+	}
+	ok(t, call(t, s, "get_access_log", map[string]any{}), &out)
+	if len(out.Events) != 2 {
+		t.Fatalf("all: %+v", out.Events)
 	}
 }

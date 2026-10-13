@@ -61,7 +61,8 @@ func New(ctx context.Context, cfg config.Config, opts Options) (*App, error) {
 
 	mux := http.NewServeMux()
 	authService.RegisterHandlers(mux)
-	web.New(web.Config{Files: svc, Auth: authService, HCA: hca, Version: cfg.Version}).Register(mux)
+	web.New(web.Config{Files: svc, Auth: authService, HCA: hca, Version: cfg.Version,
+		AdminToken: cfg.AdminToken, ClientIPHeader: cfg.ClientIPHeader, Logger: logger}).Register(mux)
 
 	mcpServer := mcpserver.New(mcpserver.Config{Files: svc, Auth: authService, Fetcher: fetch.New(fetch.Options{}), Version: cfg.Version})
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})

@@ -42,6 +42,27 @@ var migrations = []string{
 	// Emails (or "@domain" entries) allowed to open a file after signing in
 	// with Hack Club Auth. Empty means no email restriction.
 	`ALTER TABLE files ADD COLUMN allowed_emails text[] NOT NULL DEFAULT '{}';`,
+	// Audit log of access to restricted files. No foreign key: the trail
+	// outlives the file, so name and namespace are copied in.
+	`CREATE TABLE access_events (
+		id bigserial PRIMARY KEY,
+		at timestamptz NOT NULL,
+		file_id uuid,
+		namespace uuid,
+		name text NOT NULL DEFAULT '',
+		version integer NOT NULL DEFAULT 0,
+		event text NOT NULL,
+		via text NOT NULL DEFAULT '',
+		email text NOT NULL DEFAULT '',
+		ip text NOT NULL DEFAULT '',
+		country text NOT NULL DEFAULT '',
+		user_agent text NOT NULL DEFAULT '',
+		referer text NOT NULL DEFAULT '',
+		remote_addr text NOT NULL DEFAULT '',
+		forwarded_for text NOT NULL DEFAULT '',
+		status integer NOT NULL DEFAULT 0
+	);
+	CREATE INDEX access_events_file ON access_events (file_id, id DESC);`,
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {

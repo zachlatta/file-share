@@ -79,21 +79,43 @@ func (h *Handler) loginCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{Name: stateCookieName, Path: "/oauth/callback", MaxAge: -1, HttpOnly: true, Secure: h.secure, SameSite: http.SameSiteLaxMode})
 	_, namespace, _ := localFilePath(st.Next)
+	target := h.fileAt(r, st.Next, namespace)
 	if q.Get("error") != "" {
 		renderMessage(w, http.StatusBadRequest, "Sign-in cancelled", "Sign-in with Hack Club was cancelled.", st.Next)
+		h.audit(r, target, "sign_in_failed", "email", "", http.StatusBadRequest, target.Version)
 		return
 	}
 	email, err := h.hca.Email(r.Context(), q.Get("code"))
 	if err != nil {
 		renderMessage(w, http.StatusBadGateway, "Sign-in failed", "Hack Club Auth did not confirm your email address. Please try again.", st.Next)
+		h.audit(r, target, "sign_in_failed", "email", "", http.StatusBadGateway, target.Version)
 		return
 	}
+	h.audit(r, target, "sign_in", "email", email, http.StatusSeeOther, target.Version)
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookieName(namespace), Value: h.auth.SignEmailSession(namespace, email, emailSessionTTL),
 		Path: "/" + namespace + "/", MaxAge: int(emailSessionTTL.Seconds()),
 		HttpOnly: true, Secure: h.secure, SameSite: http.SameSiteLaxMode,
 	})
 	http.Redirect(w, r, st.Next, http.StatusSeeOther)
+}
+
+// fileAt finds the live file a sign-in returns to, for the audit log. If it
+// is gone, only the namespace is known.
+func (h *Handler) fileAt(r *http.Request, escapedPath, namespace string) files.File {
+	p, err := url.PathUnescape(escapedPath)
+	if err != nil {
+		return files.File{Namespace: namespace}
+	}
+	name := strings.TrimPrefix(p, "/"+namespace+"/")
+	if name == "" || strings.HasSuffix(name, "/") {
+		name += "index.html"
+	}
+	f, err := h.files.Lookup(r.Context(), namespace, name)
+	if err != nil {
+		return files.File{Namespace: namespace, Name: name}
+	}
+	return f
 }
 
 // localFilePath accepts only a path of the form /<namespace-uuid>/<rest>, so
@@ -126,7 +148,8 @@ type gateData struct {
 // renderGate shows the page for a restricted file: a Hack Club sign-in
 // button when the file has allowed emails, and a password form when it has a
 // password. Either one opens the file.
-func (h *Handler) renderGate(w http.ResponseWriter, r *http.Request, f files.File, message string) {
+// It returns the status it wrote.
+func (h *Handler) renderGate(w http.ResponseWriter, r *http.Request, f files.File, message string) int {
 	data := gateData{Name: path.Base(f.Name), Password: f.HasPassword, Error: message}
 	status := http.StatusUnauthorized
 	if len(f.AllowedEmails) > 0 && h.hca != nil {
@@ -141,6 +164,7 @@ func (h *Handler) renderGate(w http.ResponseWriter, r *http.Request, f files.Fil
 	setPageHeaders(w)
 	w.WriteHeader(status)
 	_ = gatePage.Execute(w, data)
+	return status
 }
 
 func setPageHeaders(w http.ResponseWriter) {

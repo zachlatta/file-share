@@ -176,6 +176,7 @@ func TestHackClubAuthWiring(t *testing.T) {
 		Secret: secret, PublicURL: server.URL, DatabaseURL: pgtest.New(t),
 		Retention: 30 * 24 * time.Hour, MaxUploadBytes: 10 << 20, PurgeInterval: time.Hour, Version: "test",
 		HCAClientID: "cid", HCAClientSecret: "csecret", HCAURL: "https://auth.hackclub.com",
+		AdminToken: "app-admin-token-0123456789abcdef",
 	}
 	app, err := New(context.Background(), cfg, Options{Blobs: blob.NewMemory()})
 	if err != nil {
@@ -192,5 +193,12 @@ func TestHackClubAuthWiring(t *testing.T) {
 	}
 	if strings.Contains(loc.String(), "csecret") {
 		t.Fatal("client secret leaked into the authorize URL")
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/files", nil)
+	req.Header.Set("Authorization", "Bearer app-admin-token-0123456789abcdef")
+	rec = httptest.NewRecorder()
+	app.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin API: %d %s", rec.Code, rec.Body)
 	}
 }

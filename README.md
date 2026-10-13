@@ -27,6 +27,12 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
   get a password page, and the unlock cookie is bound to the current password, so changing it
   locks out old sessions. Scripts can use `?password=` or HTTP Basic auth. If a file has both a
   password and allowed emails, either one opens it.
+- **Audit log and admin dashboard.** Every access to a password- or email-protected file is
+  recorded: views (and how access was granted), visitors turned away at the gate, wrong
+  passwords, and Hack Club sign-ins, with IP, country, user agent, referrer (query string
+  removed) and the signed-in email. Signed download URLs for protected files are logged too.
+  Public files are not logged. Browse it at `/admin` after signing in with `ADMIN_TOKEN`, or
+  ask an agent through `get_access_log`. The log outlives purged files.
 - **Large files.** `create_upload_url` returns a short-lived signed URL that takes a plain
   `curl --upload-file`, so agents never base64 big files through a chat message. Cloudflare
   rejects request bodies over 100 MB, so bigger files go up in parts: `PUT <url>?part=1..N`
@@ -40,7 +46,7 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
 | Area | Tools |
 | --- | --- |
 | Upload | `upload_file` (text, base64 or `source_url`), `create_upload_url`, `replace_file` |
-| Read | `read_file`, `create_download_url`, `get_file`, `list_files`, `list_versions`, `get_stats` |
+| Read | `read_file`, `create_download_url`, `get_file`, `list_files`, `list_versions`, `get_access_log`, `get_stats` |
 | History | `rollback_file`, `delete_file`, `restore_file`, `purge_file` |
 | Manage | `rename_file`, `set_allowed_emails`, `set_password`, `remove_password` |
 
@@ -61,6 +67,12 @@ This is the same design as the personal data warehouse:
   verified email from the userinfo endpoint, and stores it in an HMAC-signed, HttpOnly cookie
   scoped to that file's namespace. The OAuth `state` is signed and bound to the browser by a
   short-lived cookie, and it can only return to a `/<namespace>/…` path.
+
+- **The admin dashboard** (`/admin`) takes `ADMIN_TOKEN`, which is separate from `MCP_SECRET`
+  and only reads the audit log. The page keeps the token in memory and sends it as a bearer
+  header to `/api/admin/*`; it never sets a cookie or uses web storage, because uploaded HTML
+  runs on this origin. `Cross-Origin-Opener-Policy: same-origin` and `frame-ancestors 'none'`
+  stop an uploaded page from opening or framing the dashboard. Reloading signs you out.
 
 ## HTTP API
 
@@ -113,6 +125,8 @@ signed upload URL for anything larger.
 | `SOURCE_COMMIT` | `dev` | Version on `/healthz` (Coolify sets it) |
 | `HCA_CLIENT_ID`, `HCA_CLIENT_SECRET` | unset (email restriction off) | Hack Club Auth app credentials; its redirect URI must be `PUBLIC_URL/oauth/callback` |
 | `HCA_URL` | `https://auth.hackclub.com` | Hack Club Auth origin |
+| `ADMIN_TOKEN` | unset (dashboard off) | 24+ chars, different from `MCP_SECRET`; unlocks `/admin` |
+| `CLIENT_IP_HEADER` | unset (socket address) | Trusted proxy header with the visitor IP, e.g. `CF-Connecting-IP` behind Cloudflare. Only set it if the origin can't be reached except through that proxy, since anyone else can forge it |
 
 `source_url` uploads refuse private, loopback, link-local and CGNAT/tailnet addresses, so a
 public file can never be made from something only the server can reach.

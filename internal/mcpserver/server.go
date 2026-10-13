@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/zachlatta/file-share/internal/auth"
 	"github.com/zachlatta/file-share/internal/fetch"
@@ -97,6 +98,18 @@ type PasswordInput struct {
 type EmailsInput struct {
 	File   string   `json:"file" jsonschema:"The file: its ID, its public URL, or namespace/name."`
 	Emails []string `json:"emails" jsonschema:"The complete new list: email addresses, or '@domain.com' for a whole domain. An empty list removes the email restriction."`
+}
+
+type AccessLogInput struct {
+	File   string `json:"file,omitempty" jsonschema:"Only events for this file: its ID, public URL, or namespace/name. Omit for all files."`
+	Event  string `json:"event,omitempty" jsonschema:"Only this event: view, denied, wrong_password, unlock, sign_in or sign_in_failed."`
+	Search string `json:"search,omitempty" jsonschema:"Case-insensitive substring of the email, IP, user agent or file name."`
+	Before int64  `json:"before,omitempty" jsonschema:"Only events with an ID below this, for paging."`
+	Limit  int    `json:"limit,omitempty" jsonschema:"Max events (default 200, max 1000)."`
+}
+
+type accessLogOutput struct {
+	Events []files.AccessEvent `json:"events"`
 }
 
 type PurgeInput struct {
@@ -204,6 +217,7 @@ func New(cfg Config) *mcp.Server {
 	add(srv, "set_password", "Set or change the password visitors must enter to open a file. Old unlock cookies stop working.", updating, s.setPassword)
 	add(srv, "remove_password", "Remove a file's password so anyone with the link can open it.", updating, s.removePassword)
 	add(srv, "set_allowed_emails", "Set exactly who can open a file: visitors sign in with Hack Club Auth and must use one of these emails (or match an '@domain' entry). Replaces the whole list; an empty list removes the restriction. Takes effect immediately, including for people already signed in.", updating, s.setAllowedEmails)
+	add(srv, "get_access_log", "Audit log for password- and email-protected files, newest first: who viewed them (signed-in email, IP, country, user agent, referrer), who was turned away, wrong passwords and Hack Club sign-ins. Public files are not logged.", readOnly, s.accessLog)
 	add(srv, "get_stats", "Totals (files, bytes, deleted files, namespaces), the retention window, and the upload size limit.", readOnly, s.stats)
 	return srv
 }
@@ -451,6 +465,24 @@ func (s *server) removePassword(ctx context.Context, in FileInput) (files.File, 
 
 func (s *server) setAllowedEmails(ctx context.Context, in EmailsInput) (files.File, error) {
 	return s.withFile(ctx, in.File, func(f files.File) (files.File, error) { return s.files.SetAllowedEmails(ctx, f.ID, in.Emails) })
+}
+
+func (s *server) accessLog(ctx context.Context, in AccessLogInput) (accessLogOutput, error) {
+	q := files.AccessQuery{Event: in.Event, Search: in.Search, Before: in.Before, Limit: in.Limit}
+	if id, err := uuid.Parse(strings.TrimSpace(in.File)); err == nil {
+		q.FileID = id.String() // works for purged files too
+	} else if in.File != "" {
+		f, err := s.files.Resolve(ctx, in.File)
+		if err != nil {
+			return accessLogOutput{}, err
+		}
+		q.FileID = f.ID
+	}
+	events, err := s.files.ListAccess(ctx, q)
+	if events == nil {
+		events = []files.AccessEvent{}
+	}
+	return accessLogOutput{Events: events}, err
 }
 
 func (s *server) purge(ctx context.Context, in PurgeInput) (okOutput, error) {

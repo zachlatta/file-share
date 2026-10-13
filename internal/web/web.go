@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -32,18 +33,34 @@ type Config struct {
 	// disables it.
 	HCA     *hcauth.Client
 	Version string
+	// AdminToken unlocks the /admin audit dashboard. Empty disables it.
+	AdminToken string
+	// ClientIPHeader is the trusted proxy header holding the visitor IP.
+	ClientIPHeader string
+	Logger         *slog.Logger
 }
 
 type Handler struct {
-	files   *files.Service
-	auth    *auth.Service
-	hca     *hcauth.Client
-	version string
-	secure  bool
+	files      *files.Service
+	auth       *auth.Service
+	hca        *hcauth.Client
+	version    string
+	secure     bool
+	adminToken string
+	ipHeader   string
+	logger     *slog.Logger
 }
 
 func New(cfg Config) *Handler {
-	return &Handler{files: cfg.Files, auth: cfg.Auth, hca: cfg.HCA, version: cfg.Version, secure: strings.HasPrefix(cfg.Files.BaseURL(), "https://")}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Handler{
+		files: cfg.Files, auth: cfg.Auth, hca: cfg.HCA, version: cfg.Version,
+		secure:     strings.HasPrefix(cfg.Files.BaseURL(), "https://"),
+		adminToken: cfg.AdminToken, ipHeader: cfg.ClientIPHeader, logger: logger,
+	}
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -65,6 +82,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /oauth/hackclub", h.loginStart)
 	mux.HandleFunc("GET /oauth/callback", h.loginCallback)
+
+	h.registerAdmin(mux)
 
 	mux.HandleFunc("GET /{ns}/{name...}", h.serve)
 	mux.HandleFunc("POST /{ns}/{name...}", h.unlock)
@@ -112,9 +131,16 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		h.notFound(w, r, err)
 		return
 	}
-	if f.Restricted() && !h.unlocked(r, f) {
-		h.renderGate(w, r, f, "")
-		return
+	if f.Restricted() {
+		via, email := h.access(r, f)
+		if via == "" {
+			status := h.renderGate(w, r, f, "")
+			h.audit(r, f, "denied", "", email, status, f.Version)
+			return
+		}
+		if countsAsView(r) {
+			h.audit(r, f, "view", via, email, http.StatusOK, f.Version)
+		}
 	}
 	h.send(w, r, f, 0)
 }
@@ -133,9 +159,11 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 	}
 	if !h.files.CheckPassword(f, r.PostFormValue("password")) {
 		time.Sleep(250 * time.Millisecond) // blunt online guessing
-		h.renderGate(w, r, f, "Wrong password.")
+		status := h.renderGate(w, r, f, "Wrong password.")
+		h.audit(r, f, "wrong_password", "password_form", h.sessionEmail(r, f.Namespace), status, f.Version)
 		return
 	}
+	h.audit(r, f, "unlock", "password_form", h.sessionEmail(r, f.Namespace), http.StatusSeeOther, f.Version)
 	http.SetCookie(w, &http.Cookie{
 		Name: cookieName(f.ID), Value: h.auth.MAC("file-password", f.ID, f.PasswordStamp),
 		Path: "/" + f.Namespace + "/", MaxAge: 30 * 24 * 3600,
@@ -146,25 +174,28 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 
 func cookieName(fileID string) string { return "fsp_" + strings.ReplaceAll(fileID, "-", "") }
 
-// unlocked reports whether the request may open a restricted file: by the
-// file's password, or by a signed-in email the file allows.
-func (h *Handler) unlocked(r *http.Request, f files.File) bool {
-	if len(f.AllowedEmails) > 0 && f.AllowsEmail(h.sessionEmail(r, f.Namespace)) {
-		return true
+// access reports how a request may open a restricted file ("" if it may
+// not) and the signed-in email, if any.
+func (h *Handler) access(r *http.Request, f files.File) (via, email string) {
+	if len(f.AllowedEmails) > 0 {
+		email = h.sessionEmail(r, f.Namespace)
+		if f.AllowsEmail(email) {
+			return "email", email
+		}
 	}
 	if !f.HasPassword {
-		return false
+		return "", email
 	}
 	if c, err := r.Cookie(cookieName(f.ID)); err == nil && c.Value == h.auth.MAC("file-password", f.ID, f.PasswordStamp) {
-		return true
+		return "password_cookie", email
 	}
 	if pw := r.URL.Query().Get("password"); pw != "" && h.files.CheckPassword(f, pw) {
-		return true
+		return "password_query", email
 	}
 	if _, pw, ok := r.BasicAuth(); ok && h.files.CheckPassword(f, pw) {
-		return true
+		return "basic_auth", email
 	}
-	return false
+	return "", email
 }
 
 // send streams a version of f, supporting ranges and conditional requests.
@@ -211,6 +242,13 @@ func (h *Handler) signedDownload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.notFound(w, r, err)
 		return
+	}
+	if f.Restricted() && countsAsView(r) {
+		version := grant.Version
+		if version <= 0 {
+			version = f.Version
+		}
+		h.audit(r, f, "view", "download_url", "", http.StatusOK, version)
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
 	h.send(w, r, f, grant.Version)

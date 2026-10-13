@@ -23,7 +23,10 @@ import (
 
 func TestMain(m *testing.M) { pgtest.Main(m) }
 
-const secret = "web-test-secret-0123456789-abcdef"
+const (
+	secret     = "web-test-secret-0123456789-abcdef"
+	adminToken = "web-test-admin-token-0123456789-xyz"
+)
 
 type env struct {
 	files   *files.Service
@@ -49,7 +52,7 @@ func newEnvWith(t *testing.T, hca *hcauth.Client) *env {
 	t.Cleanup(svc.Close)
 	a := auth.NewService(auth.Config{Secret: secret, BaseURL: "https://files.example.com"})
 	mux := http.NewServeMux()
-	New(Config{Files: svc, Auth: a, HCA: hca, Version: "test"}).Register(mux)
+	New(Config{Files: svc, Auth: a, HCA: hca, Version: "test", AdminToken: adminToken, ClientIPHeader: "CF-Connecting-IP"}).Register(mux)
 	return &env{files: svc, auth: a, handler: mux}
 }
 
