@@ -175,12 +175,6 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request, f files.File, ver
 	} else {
 		header.Set("Cache-Control", "public, max-age=60, must-revalidate")
 	}
-	// Active content runs in an opaque origin so it can never act as this
-	// site (whose OAuth endpoints and password cookies share the origin).
-	mediaType, _, _ := mime.ParseMediaType(v.ContentType)
-	if mediaType == "text/html" || mediaType == "image/svg+xml" || mediaType == "application/xhtml+xml" || mediaType == "application/xml" || mediaType == "text/xml" {
-		header.Set("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads")
-	}
 	http.ServeContent(w, r, "", v.CreatedAt, obj)
 }
 

@@ -99,15 +99,17 @@ func TestServesFiles(t *testing.T) {
 	}
 }
 
-func TestHTMLIsSandboxedAndIndexServed(t *testing.T) {
+func TestHTMLRunsNormallyAndIndexServed(t *testing.T) {
 	e := newEnv(t)
 	f := e.upload(t, "index.html", "<h1>site</h1>", "")
 	rec := e.do(httptest.NewRequest(http.MethodGet, "/"+f.Namespace+"/", nil))
 	if rec.Code != 200 || rec.Body.String() != "<h1>site</h1>" {
 		t.Fatalf("index: %d %q", rec.Code, rec.Body)
 	}
-	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "sandbox") || strings.Contains(csp, "allow-same-origin") {
-		t.Fatalf("csp = %q", csp)
+	// Uploaded pages must run as ordinary pages: a CSP sandbox gives them an
+	// opaque origin, which disables Cache Storage and broke a MapLibre map.
+	if csp := rec.Header().Get("Content-Security-Policy"); strings.Contains(csp, "sandbox") {
+		t.Fatalf("html is sandboxed: csp = %q", csp)
 	}
 	if rec := e.do(httptest.NewRequest(http.MethodGet, "/"+f.Namespace, nil)); rec.Code != http.StatusMovedPermanently {
 		t.Fatalf("namespace without slash: %d", rec.Code)

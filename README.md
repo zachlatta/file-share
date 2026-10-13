@@ -70,9 +70,10 @@ signed upload URL for anything larger.
 - `GET /<ns>/<name>` serves the current version with range requests, ETags and
   `Content-Disposition: inline`. Add `?download` to get an attachment instead.
 - `GET /<ns>/` serves `index.html` if the namespace has one.
-- HTML, SVG and XML run under `Content-Security-Policy: sandbox` without `allow-same-origin`.
-  Uploaded pages can run scripts, but in an opaque origin, so they can never act as this site,
-  whose OAuth endpoints and password cookies share the origin.
+- HTML is served as an ordinary page, so uploaded sites and maps work fully. A CSP sandbox was
+  tried and dropped, because the opaque origin it creates disables Cache Storage and broke a
+  MapLibre map. This is safe because only the owner can upload, OAuth and the API never use
+  ambient cookies, and password cookies are HttpOnly.
 
 ## Storage
 
