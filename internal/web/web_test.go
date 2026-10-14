@@ -300,28 +300,65 @@ func TestAPIRejectsOversizeUpload(t *testing.T) {
 	}
 }
 
+// link makes a single-use upload URL path, as create_upload_url does.
+func (e *env) link(t *testing.T, in files.UploadLinkInput) string {
+	t.Helper()
+	in.ExpiresAt = time.Now().Add(time.Hour)
+	link, err := e.files.CreateUploadLink(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "/upload/" + e.auth.SignUpload(link.ID, time.Hour)
+}
+
 func TestSignedUploadURL(t *testing.T) {
 	e := newEnv(t)
-	token := e.auth.SignUpload(auth.UploadGrant{Filename: "video.mp4", ClientName: "agent"}, time.Hour)
-	req := httptest.NewRequest(http.MethodPut, "/upload/"+token, strings.NewReader("fake mp4 bytes"))
-	rec := e.do(req)
+	path := e.link(t, files.UploadLinkInput{Name: "video.mp4", Client: "agent", Password: "pw"})
+	rec := e.do(httptest.NewRequest(http.MethodPut, path, strings.NewReader("fake mp4 bytes")))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("signed upload: %d %s", rec.Code, rec.Body)
 	}
 	f := decodeFile(t, rec)
-	if f.Name != "video.mp4" || f.ContentType != "video/mp4" {
+	if f.Name != "video.mp4" || f.ContentType != "video/mp4" || !f.HasPassword {
 		t.Fatalf("file = %+v", f)
 	}
-	// Replace grant.
-	token = e.auth.SignUpload(auth.UploadGrant{FileID: f.ID}, time.Hour)
+	// One-off: the link stops working once used.
+	if rec := e.do(httptest.NewRequest(http.MethodPut, path, strings.NewReader("again"))); rec.Code != http.StatusGone {
+		t.Fatalf("reused link: %d %s", rec.Code, rec.Body)
+	}
+	// Replace link; multipart works too.
+	path = e.link(t, files.UploadLinkInput{FileID: f.ID})
 	body, ct := multipartBody(t, "ignored.mp4", "v2 bytes", nil)
-	req = httptest.NewRequest(http.MethodPost, "/upload/"+token, body)
+	req := httptest.NewRequest(http.MethodPost, path, body)
 	req.Header.Set("Content-Type", ct)
 	if rec := e.do(req); rec.Code != 200 || decodeFile(t, rec).Version != 2 {
 		t.Fatalf("signed replace: %d %s", rec.Code, rec.Body)
 	}
 	if rec := e.do(httptest.NewRequest(http.MethodPut, "/upload/garbage", strings.NewReader("x"))); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("bad token: %d", rec.Code)
+	}
+}
+
+func TestSignedUploadURLWithoutName(t *testing.T) {
+	e := newEnv(t)
+	path := e.link(t, files.UploadLinkInput{})
+	// Access settings belong to the link, not the request.
+	body, ct := multipartBody(t, "photo.png", "\x89PNG fake", map[string]string{"password": "pw"})
+	req := httptest.NewRequest(http.MethodPost, path, body)
+	req.Header.Set("Content-Type", ct)
+	if rec := e.do(req); rec.Code != http.StatusBadRequest {
+		t.Fatalf("password in request: %d %s", rec.Code, rec.Body)
+	}
+	body, ct = multipartBody(t, "photo.png", "\x89PNG fake", nil)
+	req = httptest.NewRequest(http.MethodPost, path, body)
+	req.Header.Set("Content-Type", ct)
+	rec := e.do(req)
+	if rec.Code != http.StatusCreated || decodeFile(t, rec).Name != "photo.png" {
+		t.Fatalf("multipart name: %d %s", rec.Code, rec.Body)
+	}
+	path = e.link(t, files.UploadLinkInput{})
+	if rec := e.do(httptest.NewRequest(http.MethodPut, path+"?name=a%20b.txt", strings.NewReader("x"))); rec.Code != http.StatusCreated || decodeFile(t, rec).Name != "a b.txt" {
+		t.Fatalf("raw ?name=: %d %s", rec.Code, rec.Body)
 	}
 }
 
@@ -353,17 +390,17 @@ func TestHealthAndHome(t *testing.T) {
 
 func TestChunkedSignedUpload(t *testing.T) {
 	e := newEnv(t)
-	token := e.auth.SignUpload(auth.UploadGrant{Filename: "movie.mp4"}, time.Hour)
+	path := e.link(t, files.UploadLinkInput{})
 	for i, chunk := range []string{"one-", "two-", "three"} {
-		rec := e.do(httptest.NewRequest(http.MethodPut, fmt.Sprintf("/upload/%s?part=%d", token, i+1), strings.NewReader(chunk)))
+		rec := e.do(httptest.NewRequest(http.MethodPut, fmt.Sprintf("%s?part=%d", path, i+1), strings.NewReader(chunk)))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("part %d: %d %s", i+1, rec.Code, rec.Body)
 		}
 	}
-	if rec := e.do(httptest.NewRequest(http.MethodPost, "/upload/"+token+"?complete=4", nil)); rec.Code != http.StatusBadRequest {
+	if rec := e.do(httptest.NewRequest(http.MethodPost, path+"?complete=4&name=movie.mp4", nil)); rec.Code != http.StatusBadRequest {
 		t.Fatalf("complete with missing part: %d", rec.Code)
 	}
-	rec := e.do(httptest.NewRequest(http.MethodPost, "/upload/"+token+"?complete=3", nil))
+	rec := e.do(httptest.NewRequest(http.MethodPost, path+"?complete=3&name=movie.mp4", nil))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("complete: %d %s", rec.Code, rec.Body)
 	}
@@ -374,10 +411,13 @@ func TestChunkedSignedUpload(t *testing.T) {
 	if got := e.do(httptest.NewRequest(http.MethodGet, urlPath(f), nil)); got.Body.String() != "one-two-three" {
 		t.Fatalf("content = %q", got.Body)
 	}
+	if rec := e.do(httptest.NewRequest(http.MethodPut, path+"?part=1", strings.NewReader("x"))); rec.Code != http.StatusGone {
+		t.Fatalf("part after use: %d", rec.Code)
+	}
 	// Chunked replace.
-	token = e.auth.SignUpload(auth.UploadGrant{FileID: f.ID}, time.Hour)
-	_ = e.do(httptest.NewRequest(http.MethodPut, "/upload/"+token+"?part=1", strings.NewReader("v2")))
-	if rec := e.do(httptest.NewRequest(http.MethodPost, "/upload/"+token+"?complete=1", nil)); rec.Code != 200 || decodeFile(t, rec).Version != 2 {
+	path = e.link(t, files.UploadLinkInput{FileID: f.ID})
+	_ = e.do(httptest.NewRequest(http.MethodPut, path+"?part=1", strings.NewReader("v2")))
+	if rec := e.do(httptest.NewRequest(http.MethodPost, path+"?complete=1", nil)); rec.Code != 200 || decodeFile(t, rec).Version != 2 {
 		t.Fatalf("chunked replace: %d %s", rec.Code, rec.Body)
 	}
 }

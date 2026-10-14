@@ -290,10 +290,10 @@ func TestStaticBearer(t *testing.T) {
 
 func TestSignedURLs(t *testing.T) {
 	s, _, c := newTestService(t)
-	token := s.SignUpload(UploadGrant{Namespace: "ns", Filename: "a.txt"}, time.Hour)
-	grant, err := s.VerifyUpload(token)
-	if err != nil || grant.Namespace != "ns" || grant.Filename != "a.txt" {
-		t.Fatalf("verify upload: %+v %v", grant, err)
+	token := s.SignUpload("link-1", time.Hour)
+	link, err := s.VerifyUpload(token)
+	if err != nil || link != "link-1" {
+		t.Fatalf("verify upload: %q %v", link, err)
 	}
 	c.t = c.t.Add(2 * time.Hour)
 	if _, err := s.VerifyUpload(token); err == nil {

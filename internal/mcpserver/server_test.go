@@ -210,10 +210,18 @@ func TestDeleteRestorePurgeAndPasswords(t *testing.T) {
 func TestSignedURLsAndSourceURL(t *testing.T) {
 	s := connect(t)
 	var up uploadURLOutput
-	ok(t, call(t, s, "create_upload_url", map[string]any{"name": "big.mov"}), &up)
-	if !strings.HasPrefix(up.UploadURL, "https://files.example.com/upload/") || !strings.Contains(up.Curl, "--upload-file") ||
-		!strings.Contains(up.CurlChunked, "?part=") || !strings.Contains(up.CurlChunked, "?complete=") || up.MaxSingleRequestMB != 95 {
+	ok(t, call(t, s, "create_upload_url", map[string]any{"name": "big.mov", "password": "pw", "allowed_emails": []string{"@hackclub.com"}}), &up)
+	if !strings.HasPrefix(up.UploadURL, "https://files.example.com/upload/") || !strings.Contains(up.Curl, "curl -sS --fail-with-body -F 'file=@") ||
+		!strings.Contains(up.CurlChunked, "?part=") || !strings.Contains(up.CurlChunked, "complete=") || up.MaxSingleRequestMB != 95 ||
+		!up.SingleUse || up.URL != "https://files.example.com/"+up.Namespace+"/big.mov" {
 		t.Fatalf("upload url = %+v", up)
+	}
+	if res := call(t, s, "create_upload_url", map[string]any{"name": "x.txt", "allowed_emails": []string{"nope"}}); !res.IsError {
+		t.Fatal("bad allowed_emails accepted")
+	}
+	ok(t, call(t, s, "create_upload_url", map[string]any{}), &up)
+	if up.URL != "" || up.Namespace == "" {
+		t.Fatalf("nameless upload url = %+v", up)
 	}
 	var f files.File
 	ok(t, call(t, s, "upload_file", map[string]any{"name": "a.txt", "content_text": "a"}), &f)

@@ -413,21 +413,29 @@ func (h *Handler) apiList(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusOK, map[string]any{"files": list}, err)
 }
 
+// signedUpload serves single-use upload links from create_upload_url. The
+// link decides where the file goes and who can open it; the request sends the
+// bytes and, if the link has no name, the file name (multipart file name or
+// ?name=).
 func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
-	token := r.PathValue("token")
-	grant, err := h.auth.VerifyUpload(token)
+	linkID, err := h.auth.VerifyUpload(r.PathValue("token"))
 	if err != nil {
 		http.Error(w, "invalid or expired upload link", http.StatusUnauthorized)
 		return
 	}
-	client := grant.ClientName
-	if client == "" {
-		client = "upload-url"
+	link, err := h.files.UploadLink(r.Context(), linkID)
+	if err != nil {
+		respond(w, 0, nil, err)
+		return
+	}
+	status := http.StatusCreated
+	if link.FileID != "" {
+		status = http.StatusOK
 	}
 	q := r.URL.Query()
 	// Chunked mode, for bodies larger than a proxy allows in one request:
 	// PUT ?part=1..N, then POST ?complete=N.
-	sum := sha256.Sum256([]byte(token))
+	sum := sha256.Sum256([]byte(linkID))
 	uploadKey := hex.EncodeToString(sum[:16])
 	if q.Has("part") {
 		n, err := strconv.Atoi(q.Get("part"))
@@ -449,24 +457,19 @@ func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
 			respond(w, 0, nil, fmt.Errorf("%w: complete must be the number of parts", files.ErrInvalid))
 			return
 		}
-		status := http.StatusCreated
 		f, err := h.files.CompleteParts(r.Context(), uploadKey, parts, func(body io.Reader) (files.File, error) {
-			if grant.FileID != "" {
-				status = http.StatusOK
-				return h.files.Replace(r.Context(), grant.FileID, files.ReplaceInput{Body: body, Size: -1, Client: client})
-			}
-			return h.files.Upload(r.Context(), files.UploadInput{Namespace: grant.Namespace, Name: grant.Filename, Body: body, Size: -1, Client: client})
+			return h.files.UploadWithLink(r.Context(), linkID, files.LinkUpload{Name: q.Get("name"), Body: body, Size: -1})
 		})
 		respond(w, status, f, err)
 		return
 	}
-	if grant.FileID != "" {
-		f, err := h.replace(r, client, grant.FileID)
-		respond(w, http.StatusOK, f, err)
-		return
-	}
-	f, err := h.create(r, client, grant.Namespace, grant.Filename)
-	respond(w, http.StatusCreated, f, err)
+	f, err := h.readUpload(r, func(u upload) (files.File, error) {
+		if u.namespace != "" || u.password != "" || len(u.emails) > 0 {
+			return files.File{}, fmt.Errorf("%w: namespace, password and emails are set when the upload URL is created, not in the upload", files.ErrInvalid)
+		}
+		return h.files.UploadWithLink(r.Context(), linkID, files.LinkUpload{Name: u.name, ContentType: u.contentType, Body: u.body, Size: u.size})
+	})
+	respond(w, status, f, err)
 }
 
 func respond(w http.ResponseWriter, status int, v any, err error) {
@@ -489,6 +492,8 @@ func StatusFor(err error) int {
 		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, files.ErrInvalid):
 		return http.StatusBadRequest
+	case errors.Is(err, files.ErrLinkUsed):
+		return http.StatusGone
 	default:
 		return http.StatusInternalServerError
 	}

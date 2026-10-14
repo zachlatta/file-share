@@ -64,11 +64,11 @@ type signedPayload struct {
 	Challenge    string   `json:"code_challenge,omitempty"`
 	Scope        string   `json:"scope,omitempty"`
 	Namespace    string   `json:"namespace,omitempty"`
-	Filename     string   `json:"filename,omitempty"`
 	FileID       string   `json:"file_id,omitempty"`
 	Version      int      `json:"version,omitempty"`
 	Next         string   `json:"next,omitempty"`
 	Email        string   `json:"email,omitempty"`
+	LinkID       string   `json:"link_id,omitempty"`
 	Nonce        string   `json:"nonce,omitempty"`
 	Exp          int64    `json:"exp,omitempty"`
 	Iat          int64    `json:"iat,omitempty"`
@@ -374,29 +374,27 @@ func (s *Service) RequireStaticBearer(next http.Handler) http.Handler {
 	})
 }
 
-// UploadGrant authorizes one HTTP upload without the secret, so an agent can
-// hand a short-lived URL to curl. FileID set means "replace this file".
-type UploadGrant struct {
-	Namespace  string
-	Filename   string
-	FileID     string
-	ClientName string
-}
-
-func (s *Service) SignUpload(g UploadGrant, ttl time.Duration) string {
-	token, _ := s.sign(signedPayload{Type: "upload", Namespace: g.Namespace, Filename: g.Filename, FileID: g.FileID, ClientName: g.ClientName, Nonce: nonce(), Exp: s.now().Add(ttl).Unix(), Iat: s.now().Unix()})
+// SignUpload signs a URL token for the single-use upload link linkID, so an
+// agent can hand a short-lived URL to curl without the secret. The link's
+// settings and whether it has been used live in the database.
+func (s *Service) SignUpload(linkID string, ttl time.Duration) string {
+	token, _ := s.sign(signedPayload{Type: "upload", LinkID: linkID, Nonce: nonce(), Exp: s.now().Add(ttl).Unix(), Iat: s.now().Unix()})
 	return token
 }
 
-func (s *Service) VerifyUpload(token string) (UploadGrant, error) {
+// VerifyUpload returns the upload link ID a token grants.
+func (s *Service) VerifyUpload(token string) (string, error) {
 	var p signedPayload
 	if err := s.verify(token, "upload", &p); err != nil {
-		return UploadGrant{}, err
+		return "", err
 	}
 	if s.now().Unix() > p.Exp {
-		return UploadGrant{}, errors.New("upload URL expired")
+		return "", errors.New("upload URL expired")
 	}
-	return UploadGrant{Namespace: p.Namespace, Filename: p.Filename, FileID: p.FileID, ClientName: p.ClientName}, nil
+	if p.LinkID == "" {
+		return "", errors.New("upload URL has no link")
+	}
+	return p.LinkID, nil
 }
 
 // DownloadGrant lets the holder fetch one version (0 = current) of a file,

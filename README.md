@@ -33,11 +33,15 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
   removed) and the signed-in email. Signed download URLs for protected files are logged too.
   Public files are not logged. Browse it at `/admin` after signing in with `ADMIN_TOKEN`, or
   ask an agent through `get_access_log`. The log outlives purged files.
-- **Large files.** `create_upload_url` returns a short-lived signed URL that takes a plain
-  `curl --upload-file`, so agents never base64 big files through a chat message. Cloudflare
-  rejects request bodies over 100 MB, so bigger files go up in parts: `PUT <url>?part=1..N`
-  (each part 90 MB or less), then `POST <url>?complete=N`. The tool returns a ready-made
-  `curl_chunked` script. Unfinished parts are deleted after 24 hours.
+- **Upload links, no secret.** `create_upload_url` returns a one-off signed URL, so an MCP
+  client can upload a local or large file with plain `curl` and never holds `MCP_SECRET` or
+  base64s big files through a chat message. The link fixes the name (optional: omit it to use
+  the uploaded file's name), namespace, password and allowed emails; the upload only sends the
+  bytes. It works once: a second upload returns `410 Gone`. A failed upload releases it for a
+  retry, and an unused link expires (default 60 minutes, max 24 hours). Cloudflare rejects
+  request bodies over 100 MB, so bigger files go up in parts: `PUT <url>?part=1..N` (each part
+  90 MB or less), then `POST <url>?complete=N` (plus `&name=` if the link has no name). The tool
+  returns a ready-made `curl_chunked` script. Unfinished parts are deleted after 24 hours.
   `create_download_url` does the same for downloads, including old versions, password-protected
   files and deleted files.
 
@@ -61,7 +65,9 @@ This is the same design as the personal data warehouse:
   IDs, codes, access tokens (24 h) and refresh tokens (1 year) are HMAC-signed with the secret,
   so auth needs no database. Rotating `MCP_SECRET` revokes everything.
 - **Scripts use a static bearer:** `Authorization: Bearer <client_name>:<MCP_SECRET>`.
-- **Signed upload and download URLs** carry their own expiring HMAC grant.
+- **Signed upload and download URLs** carry their own expiring HMAC grant. An upload URL
+  points at a single-use `upload_links` row that holds the link's settings and is claimed
+  atomically, so it can be used once.
 - **Visitors to email-restricted files** sign in with Hack Club Auth (OpenID Connect,
   `openid email` scopes). The server exchanges the code with its client secret, reads the
   verified email from the userinfo endpoint, and stores it in an HMAC-signed, HttpOnly cookie
@@ -88,7 +94,8 @@ curl -H "$AUTH" -X POST https://files.zachlatta.com/api/files/<id>/restore      
 ```
 
 The same 100 MB per-request ceiling applies to `/api/files` through the public hostname. Use a
-signed upload URL for anything larger.
+signed upload URL for anything larger. Agents connected over MCP should use `create_upload_url`
+instead of this API, so they never need the secret.
 
 ## Serving
 

@@ -34,6 +34,7 @@ var (
 	ErrExists   = errors.New("a live file with that name already exists in the namespace")
 	ErrInvalid  = errors.New("invalid input")
 	ErrTooLarge = errors.New("file is larger than the upload limit")
+	ErrLinkUsed = errors.New("this upload link has already been used; create a new one")
 )
 
 type Config struct {
@@ -170,6 +171,19 @@ type UploadInput struct {
 }
 
 func (s *Service) Upload(ctx context.Context, in UploadInput) (File, error) {
+	var hash string
+	if in.Password != "" {
+		var err error
+		if hash, err = hashPassword(in.Password); err != nil {
+			return File{}, err
+		}
+	}
+	return s.upload(ctx, in, hash)
+}
+
+// upload creates a file with the already-hashed password hash; in.Password is
+// ignored.
+func (s *Service) upload(ctx context.Context, in UploadInput, hash string) (File, error) {
 	name, err := CleanName(in.Name)
 	if err != nil {
 		return File{}, err
@@ -181,12 +195,6 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (File, error) {
 		return File{}, fmt.Errorf("%w: namespace must be a UUID", ErrInvalid)
 	} else {
 		ns = parsed.String()
-	}
-	var hash string
-	if in.Password != "" {
-		if hash, err = hashPassword(in.Password); err != nil {
-			return File{}, err
-		}
 	}
 	emails, err := s.cleanEmails(in.AllowedEmails)
 	if err != nil {
@@ -535,6 +543,8 @@ type PurgeResult struct {
 	Blobs    int `json:"blobs"`
 	// Parts counts abandoned chunked-upload parts removed.
 	Parts int `json:"parts"`
+	// Links counts expired upload links removed.
+	Links int `json:"links"`
 }
 
 // Purge permanently removes deleted files and replaced versions that are
@@ -559,7 +569,12 @@ func (s *Service) Purge(ctx context.Context) (PurgeResult, error) {
 		}
 		res.Versions = len(keys)
 		tag, err := tx.Exec(ctx, `DELETE FROM files WHERE deleted_at IS NOT NULL AND deleted_at <= $1`, cutoff)
+		if err != nil {
+			return err
+		}
 		res.Files = int(tag.RowsAffected())
+		tag, err = tx.Exec(ctx, `DELETE FROM upload_links WHERE expires_at <= $1`, s.nowUTC())
+		res.Links = int(tag.RowsAffected())
 		return err
 	})
 	if err != nil {

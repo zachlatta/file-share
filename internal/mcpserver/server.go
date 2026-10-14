@@ -118,10 +118,12 @@ type PurgeInput struct {
 }
 
 type UploadURLInput struct {
-	Name           string `json:"name,omitempty" jsonschema:"Name for a new file. Required unless file is given."`
-	Namespace      string `json:"namespace,omitempty" jsonschema:"Existing namespace UUID for a new file. Omit for a new namespace."`
-	File           string `json:"file,omitempty" jsonschema:"To replace an existing file instead: its ID, URL or namespace/name."`
-	ExpiresMinutes int    `json:"expires_minutes,omitempty" jsonschema:"How long the URL works (default 60, max 1440)."`
+	Name           string   `json:"name,omitempty" jsonschema:"Name for the new file. Omit to use the uploaded file's own name."`
+	Namespace      string   `json:"namespace,omitempty" jsonschema:"Existing namespace UUID for the new file. Omit for a new namespace."`
+	Password       string   `json:"password,omitempty" jsonschema:"Optional password visitors must enter to open the new file."`
+	AllowedEmails  []string `json:"allowed_emails,omitempty" jsonschema:"Optional: only these people can open the new file, after signing in with Hack Club Auth. Exact addresses, or '@domain.com' for a whole domain."`
+	File           string   `json:"file,omitempty" jsonschema:"To replace an existing file instead: its ID, URL or namespace/name. Its name, password and allowed emails are kept."`
+	ExpiresMinutes int      `json:"expires_minutes,omitempty" jsonschema:"How long the URL works if unused (default 60, max 1440)."`
 }
 
 type DownloadURLInput struct {
@@ -159,10 +161,14 @@ type okOutput struct {
 }
 
 type uploadURLOutput struct {
-	UploadURL string    `json:"upload_url"`
-	Method    string    `json:"method"`
+	UploadURL string `json:"upload_url"`
+	// SingleUse: the URL stops working after one successful upload.
+	SingleUse bool      `json:"single_use"`
 	ExpiresAt time.Time `json:"expires_at"`
-	Curl      string    `json:"curl"`
+	// URL is the file's public URL once uploaded, when the name is known.
+	URL       string `json:"url,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Curl      string `json:"curl"`
 	// The public proxy rejects request bodies over 100 MB, so larger files
 	// must be sent in parts.
 	MaxSingleRequestMB int    `json:"max_single_request_mb"`
@@ -189,7 +195,7 @@ func New(cfg Config) *mcp.Server {
 			"namespaces are random UUIDs, so URLs are unguessable but anyone with the link can open the file unless it is restricted. "+
 			"To share with specific people, set allowed_emails (or call set_allowed_emails): visitors sign in with Hack Club Auth and only those emails (or '@domain' entries) can open the file. "+
 			"A password is the alternative for people without a Hack Club account; if a file has both, either one opens it. "+
-			"Upload small files inline (content_text or content_base64), from the web (source_url), or for large or local files call create_upload_url and PUT the bytes with curl. "+
+			"Upload small files inline (content_text or content_base64), from the web (source_url), or for large or local files call create_upload_url and send the bytes with the curl it returns; that single-use URL needs no secret or API token. "+
 			"Replacing a file keeps its URL and adds a version. Deleted files and replaced versions are kept for %d days, "+
 			"during which restore_file and rollback_file can bring them back; after that they are purged. "+
 			"Files are referenced by ID, URL, or namespace/name.", cfg.Files.BaseURL(), cfg.Files.BaseURL(), days),
@@ -202,7 +208,7 @@ func New(cfg Config) *mcp.Server {
 	destructive := &mcp.ToolAnnotations{DestructiveHint: ptr(true), OpenWorldHint: &closed}
 
 	add(srv, "upload_file", "Upload a new file and get its public URL. Give exactly one of content_text, content_base64 or source_url. Omit namespace for a fresh unguessable URL; pass a namespace to group files. Optionally restrict it to allowed_emails (sign in with Hack Club) or a password.", fetching, s.upload)
-	add(srv, "create_upload_url", "Get a short-lived URL that accepts the file bytes over HTTP, for files too large to send inline. Files up to 95 MB: run the returned curl (PUT raw body). Larger files: run curl_chunked, which PUTs 90 MB parts with ?part=N and then POSTs ?complete=N. Pass file to replace an existing file instead.", additive, s.uploadURL)
+	add(srv, "create_upload_url", "Get a single-use URL that accepts one file over HTTP, so a local or large file can be uploaded with curl and no secret. Set name, namespace, password and allowed_emails here; the upload only sends the bytes. Files up to 95 MB: run the returned curl (multipart; omit name to use the local file's name). Larger files: run curl_chunked, which PUTs 90 MB parts with ?part=N and then POSTs ?complete=N. The URL stops working after one successful upload. Pass file to upload a new version of an existing file instead.", additive, s.uploadURL)
 	add(srv, "replace_file", "Replace a file's content, keeping its URL and password. The previous content stays available as an older version for the retention window. Give exactly one of content_text, content_base64 or source_url.", fetching, s.replace)
 	mcp.AddTool(srv, &mcp.Tool{Name: "read_file", Description: "Read a file's content (current or an older version). Text comes back as text, other files as base64; images are also returned as images.", Annotations: readOnly}, s.read)
 	add(srv, "create_download_url", "Get a short-lived private URL for the exact bytes of a version of a file. It works even for restricted (password or email) or deleted files.", readOnly, s.downloadURL)
@@ -353,33 +359,31 @@ func isText(mediaType string) bool {
 }
 
 func (s *server) uploadURL(ctx context.Context, in UploadURLInput) (uploadURLOutput, error) {
-	minutes := clamp(in.ExpiresMinutes, 60, 1440)
-	grant := auth.UploadGrant{ClientName: client(ctx)}
+	ttl := time.Duration(clamp(in.ExpiresMinutes, 60, 1440)) * time.Minute
+	link := files.UploadLinkInput{
+		Namespace: in.Namespace, Name: in.Name, Password: in.Password, AllowedEmails: in.AllowedEmails,
+		Client: client(ctx), ExpiresAt: time.Now().Add(ttl),
+	}
 	if in.File != "" {
 		f, err := s.files.Resolve(ctx, in.File)
 		if err != nil {
 			return uploadURLOutput{}, err
 		}
-		if f.DeletedAt != nil {
-			return uploadURLOutput{}, fmt.Errorf("%w: file is deleted; restore it first", files.ErrNotFound)
-		}
-		grant.FileID = f.ID
-	} else {
-		name, err := files.CleanName(in.Name)
-		if err != nil {
-			return uploadURLOutput{}, err
-		}
-		grant.Filename, grant.Namespace = name, in.Namespace
+		link.FileID = f.ID
 	}
-	ttl := time.Duration(minutes) * time.Minute
-	u := s.files.BaseURL() + "/upload/" + s.auth.SignUpload(grant, ttl)
+	created, err := s.files.CreateUploadLink(ctx, link)
+	if err != nil {
+		return uploadURLOutput{}, err
+	}
+	u := s.files.BaseURL() + "/upload/" + s.auth.SignUpload(created.ID, ttl)
 	return uploadURLOutput{
-		UploadURL: u, Method: "PUT", ExpiresAt: time.Now().Add(ttl).UTC().Truncate(time.Second),
-		Curl:               fmt.Sprintf("curl --fail-with-body --upload-file ./LOCAL_FILE '%s'", u),
+		UploadURL: u, SingleUse: true, ExpiresAt: created.ExpiresAt.Truncate(time.Second),
+		URL: created.URL, Namespace: created.Namespace,
+		Curl:               fmt.Sprintf("curl -sS --fail-with-body -F 'file=@./LOCAL_FILE' '%s'", u),
 		MaxSingleRequestMB: 95,
 		CurlChunked: fmt.Sprintf(`f=./LOCAL_FILE; u='%s'; d=$(mktemp -d) && split -b 90m "$f" "$d/p." && n=0 && `+
 			`for p in "$d"/p.*; do n=$((n+1)); curl -sS --fail-with-body -X PUT --upload-file "$p" "$u?part=$n" >/dev/null || exit 1; done && `+
-			`curl -sS --fail-with-body -X POST "$u?complete=$n"; rm -rf "$d"`, u),
+			`curl -sS --fail-with-body -X POST -G --data-urlencode "complete=$n" --data-urlencode "name=${f##*/}" "$u"; rm -rf "$d"`, u),
 	}, nil
 }
 

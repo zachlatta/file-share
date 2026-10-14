@@ -63,6 +63,21 @@ var migrations = []string{
 		status integer NOT NULL DEFAULT 0
 	);
 	CREATE INDEX access_events_file ON access_events (file_id, id DESC);`,
+	// Single-use upload links handed out by create_upload_url. The link,
+	// not the request, decides where the file goes and who can open it.
+	`CREATE TABLE upload_links (
+		id uuid PRIMARY KEY,
+		namespace uuid,
+		name text NOT NULL DEFAULT '',
+		file_id uuid,
+		password_hash text,
+		allowed_emails text[] NOT NULL DEFAULT '{}',
+		client text NOT NULL DEFAULT '',
+		created_at timestamptz NOT NULL,
+		expires_at timestamptz NOT NULL,
+		used_at timestamptz
+	);
+	CREATE INDEX upload_links_expires ON upload_links (expires_at);`,
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {
