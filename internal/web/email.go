@@ -1,6 +1,7 @@
 package web
 
 import (
+	"cmp"
 	"crypto/rand"
 	"crypto/subtle"
 	"html/template"
@@ -148,19 +149,20 @@ type gateData struct {
 // renderGate shows the page for a restricted file: a Hack Club sign-in
 // button when the file has allowed emails, and a password form when it has a
 // password. Either one opens the file.
-// It returns the status it wrote.
-func (h *Handler) renderGate(w http.ResponseWriter, r *http.Request, f files.File, message string) int {
+// It returns the status it wrote: status, or 401/403 if status is 0.
+func (h *Handler) renderGate(w http.ResponseWriter, r *http.Request, f files.File, message string, status int) int {
 	data := gateData{Name: path.Base(f.Name), Password: f.HasPassword, Error: message}
-	status := http.StatusUnauthorized
+	defaultStatus := http.StatusUnauthorized
 	if len(f.AllowedEmails) > 0 && h.hca != nil {
 		next := url.QueryEscape(r.URL.EscapedPath())
 		data.Email = true
 		data.LoginURL = "/oauth/hackclub?next=" + next
 		data.SwitchURL = "/oauth/hackclub?switch=1&next=" + next
 		if data.SignedInAs = h.sessionEmail(r, f.Namespace); data.SignedInAs != "" {
-			status = http.StatusForbidden
+			defaultStatus = http.StatusForbidden
 		}
 	}
+	status = cmp.Or(status, defaultStatus)
 	setPageHeaders(w)
 	w.WriteHeader(status)
 	_ = gatePage.Execute(w, data)

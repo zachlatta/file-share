@@ -78,6 +78,8 @@ var migrations = []string{
 		used_at timestamptz
 	);
 	CREATE INDEX upload_links_expires ON upload_links (expires_at);`,
+	// A replace link can name the version it expects to replace.
+	`ALTER TABLE upload_links ADD COLUMN expected_version integer NOT NULL DEFAULT 0;`,
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {

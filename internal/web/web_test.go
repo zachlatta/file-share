@@ -32,6 +32,7 @@ type env struct {
 	files   *files.Service
 	auth    *auth.Service
 	handler http.Handler
+	limiter *failureLimiter
 }
 
 func newEnv(t *testing.T) *env {
@@ -52,8 +53,9 @@ func newEnvWith(t *testing.T, hca *hcauth.Client) *env {
 	t.Cleanup(svc.Close)
 	a := auth.NewService(auth.Config{Secret: secret, BaseURL: "https://files.example.com"})
 	mux := http.NewServeMux()
-	New(Config{Files: svc, Auth: a, HCA: hca, Version: "test", AdminToken: adminToken, ClientIPHeader: "CF-Connecting-IP"}).Register(mux)
-	return &env{files: svc, auth: a, handler: mux}
+	h := New(Config{Files: svc, Auth: a, HCA: hca, Version: "test", AdminToken: adminToken, ClientIPHeader: "CF-Connecting-IP"})
+	h.Register(mux)
+	return &env{files: svc, auth: a, handler: mux, limiter: h.passwords}
 }
 
 func (e *env) do(req *http.Request) *httptest.ResponseRecorder {
@@ -370,6 +372,9 @@ func TestSignedDownloadURL(t *testing.T) {
 	rec := e.do(httptest.NewRequest(http.MethodGet, "/download/"+token, nil))
 	if rec.Code != 200 || rec.Body.String() != "one" {
 		t.Fatalf("signed download of v1 (password bypassed by signature): %d %q", rec.Code, rec.Body)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "private, no-store" {
+		t.Fatalf("signed download cache-control = %q", cc)
 	}
 	_, _ = e.files.Delete(context.Background(), f.ID)
 	if rec := e.do(httptest.NewRequest(http.MethodGet, "/download/"+token, nil)); rec.Code != 200 {

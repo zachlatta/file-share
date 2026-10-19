@@ -32,12 +32,37 @@ type Result struct {
 	ContentLength int64
 }
 
-var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+var (
+	// Ranges that are never public hosts: CGNAT and tailnets, "this network"
+	// (0.0.0.0/8 reaches localhost on Linux), IETF protocol assignments,
+	// benchmarking, and reserved space up to the broadcast address.
+	reserved = []netip.Prefix{
+		netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"), netip.MustParsePrefix("240.0.0.0/4"),
+	}
+	// NAT64 and 6to4 addresses carry an IPv4 address, which is checked too.
+	nat64  = netip.MustParsePrefix("64:ff9b::/96")
+	sixTo4 = netip.MustParsePrefix("2002::/16")
+)
 
 func blocked(addr netip.Addr) bool {
 	addr = addr.Unmap()
+	if addr.Is6() {
+		b := addr.As16()
+		switch {
+		case nat64.Contains(addr):
+			return blocked(netip.AddrFrom4([4]byte(b[12:16])))
+		case sixTo4.Contains(addr):
+			return blocked(netip.AddrFrom4([4]byte(b[2:6])))
+		}
+	}
+	for _, p := range reserved {
+		if p.Contains(addr) {
+			return true
+		}
+	}
 	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
-		addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast() || cgnat.Contains(addr)
+		addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast()
 }
 
 func New(opts Options) *Fetcher {

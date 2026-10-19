@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 )
@@ -70,5 +71,21 @@ func TestFetchesAndNamesFile(t *testing.T) {
 	res.Body.Close()
 	if res.Filename != "download" {
 		t.Fatalf("fallback filename = %q", res.Filename)
+	}
+}
+
+func TestBlocksReservedAndEmbeddedPrivateAddresses(t *testing.T) {
+	for _, raw := range []string{
+		"0.0.0.0", "0.1.2.3", "192.0.0.8", "198.18.0.1", "240.0.0.1", "255.255.255.255",
+		"64:ff9b::7f00:1", "64:ff9b::a00:1", "2002:7f00:1::", "2002:a9fe:a9fe::", "fc00::1", "fe80::1",
+	} {
+		if !blocked(netip.MustParseAddr(raw)) {
+			t.Errorf("%s is not blocked", raw)
+		}
+	}
+	for _, raw := range []string{"1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "64:ff9b::808:808"} {
+		if blocked(netip.MustParseAddr(raw)) {
+			t.Errorf("%s is blocked", raw)
+		}
 	}
 }

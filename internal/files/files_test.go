@@ -476,3 +476,31 @@ func TestPurgeRemovesAbandonedParts(t *testing.T) {
 		t.Fatalf("stale part not purged: %+v %v %v", res, err, h.blobs.Keys())
 	}
 }
+
+// Two agents editing the same file: the later replace names the version it
+// started from and is refused once the file has moved on, instead of
+// silently dropping the other agent's work.
+func TestReplaceWithExpectedVersion(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	f := h.upload(t, "", "db.duckdb", "v1")
+	f, err := h.svc.Replace(ctx, f.ID, ReplaceInput{Body: strings.NewReader("v2 from agent A"), Size: -1, ExpectedVersion: 1})
+	if err != nil || f.Version != 2 {
+		t.Fatalf("replace at the expected version: %+v %v", f, err)
+	}
+	blobsBefore := len(h.blobs.Keys())
+	_, err = h.svc.Replace(ctx, f.ID, ReplaceInput{Body: strings.NewReader("v2 from agent B"), Size: -1, ExpectedVersion: 1})
+	if !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "version 2") {
+		t.Fatalf("stale replace: %v", err)
+	}
+	if got := h.read(t, f, 0); got != "v2 from agent A" {
+		t.Fatalf("current content = %q", got)
+	}
+	if len(h.blobs.Keys()) != blobsBefore {
+		t.Fatal("the refused upload left its blob behind")
+	}
+	// Zero means "don't check".
+	if f, err = h.svc.Replace(ctx, f.ID, ReplaceInput{Body: strings.NewReader("v3"), Size: -1}); err != nil || f.Version != 3 {
+		t.Fatalf("unchecked replace: %+v %v", f, err)
+	}
+}

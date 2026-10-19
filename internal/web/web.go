@@ -4,6 +4,7 @@
 package web
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -49,6 +50,7 @@ type Handler struct {
 	adminToken string
 	ipHeader   string
 	logger     *slog.Logger
+	passwords  *failureLimiter
 }
 
 func New(cfg Config) *Handler {
@@ -60,6 +62,7 @@ func New(cfg Config) *Handler {
 		files: cfg.Files, auth: cfg.Auth, hca: cfg.HCA, version: cfg.Version,
 		secure:     strings.HasPrefix(cfg.Files.BaseURL(), "https://"),
 		adminToken: cfg.AdminToken, ipHeader: cfg.ClientIPHeader, logger: logger,
+		passwords: newFailureLimiter(maxPasswordFailures, passwordWindow),
 	}
 }
 
@@ -72,7 +75,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.Handle("GET /api/files", api(h.apiList))
 	mux.Handle("POST /api/files", api(h.apiUpload))
 	mux.Handle("GET /api/files/{id}", api(h.apiGet))
+	mux.Handle("PATCH /api/files/{id}", api(h.apiUpdate))
+	mux.Handle("GET /api/files/{id}/content", api(h.apiDownload))
 	mux.Handle("PUT /api/files/{id}/content", api(h.apiReplace))
+	mux.Handle("GET /api/files/{id}/versions", api(h.apiVersions))
+	mux.Handle("POST /api/files/{id}/rollback", api(h.apiRollback))
 	mux.Handle("DELETE /api/files/{id}", api(h.apiDelete))
 	mux.Handle("POST /api/files/{id}/restore", api(h.apiRestore))
 
@@ -132,10 +139,18 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if f.Restricted() {
-		via, email := h.access(r, f)
+		via, email, denial := h.access(r, f)
 		if via == "" {
-			status := h.renderGate(w, r, f, "")
-			h.audit(r, f, "denied", "", email, status, f.Version)
+			switch denial.event {
+			case "wrong_password":
+				status := h.renderGate(w, r, f, "Wrong password.", 0)
+				h.audit(r, f, "wrong_password", denial.via, email, status, f.Version)
+			case "limited":
+				h.renderGate(w, r, f, tooManyPasswords, http.StatusTooManyRequests)
+			default:
+				status := h.renderGate(w, r, f, "", 0)
+				h.audit(r, f, "denied", "", email, status, f.Version)
+			}
 			return
 		}
 		if countsAsView(r) {
@@ -157,9 +172,12 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
 		return
 	}
-	if !h.files.CheckPassword(f, r.PostFormValue("password")) {
-		time.Sleep(250 * time.Millisecond) // blunt online guessing
-		status := h.renderGate(w, r, f, "Wrong password.")
+	if !h.passwords.allowed(f.ID) {
+		h.renderGate(w, r, f, tooManyPasswords, http.StatusTooManyRequests)
+		return
+	}
+	if !h.checkPassword(f, r.PostFormValue("password")) {
+		status := h.renderGate(w, r, f, "Wrong password.", 0)
 		h.audit(r, f, "wrong_password", "password_form", h.sessionEmail(r, f.Namespace), status, f.Version)
 		return
 	}
@@ -174,28 +192,54 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 
 func cookieName(fileID string) string { return "fsp_" + strings.ReplaceAll(fileID, "-", "") }
 
+const tooManyPasswords = "Too many wrong passwords for this file. Try again in a few minutes."
+
+// denial says why a request that sent a password was turned away: event is
+// "wrong_password" (via how it was sent) or "limited", or "" if no password
+// was sent.
+type denial struct{ event, via string }
+
+// checkPassword checks a password and counts a wrong one against the file.
+func (h *Handler) checkPassword(f files.File, password string) bool {
+	if h.files.CheckPassword(f, password) {
+		return true
+	}
+	h.passwords.fail(f.ID)
+	time.Sleep(wrongPasswordDelay)
+	return false
+}
+
 // access reports how a request may open a restricted file ("" if it may
-// not) and the signed-in email, if any.
-func (h *Handler) access(r *http.Request, f files.File) (via, email string) {
+// not), the signed-in email, if any, and why a sent password failed.
+func (h *Handler) access(r *http.Request, f files.File) (via, email string, d denial) {
 	if len(f.AllowedEmails) > 0 {
 		email = h.sessionEmail(r, f.Namespace)
 		if f.AllowsEmail(email) {
-			return "email", email
+			return "email", email, d
 		}
 	}
 	if !f.HasPassword {
-		return "", email
+		return "", email, d
 	}
 	if c, err := r.Cookie(cookieName(f.ID)); err == nil && c.Value == h.auth.MAC("file-password", f.ID, f.PasswordStamp) {
-		return "password_cookie", email
+		return "password_cookie", email, d
 	}
-	if pw := r.URL.Query().Get("password"); pw != "" && h.files.CheckPassword(f, pw) {
-		return "password_query", email
+	pw, via := r.URL.Query().Get("password"), "password_query"
+	if pw == "" {
+		if _, basic, ok := r.BasicAuth(); ok && basic != "" {
+			pw, via = basic, "basic_auth"
+		}
 	}
-	if _, pw, ok := r.BasicAuth(); ok && h.files.CheckPassword(f, pw) {
-		return "basic_auth", email
+	switch {
+	case pw == "":
+		return "", email, d
+	case !h.passwords.allowed(f.ID):
+		return "", email, denial{event: "limited"}
+	case h.checkPassword(f, pw):
+		return via, email, d
+	default:
+		return "", email, denial{event: "wrong_password", via: via}
 	}
-	return "", email
 }
 
 // send streams a version of f, supporting ranges and conditional requests.
@@ -216,9 +260,11 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request, f files.File, ver
 		disposition = "attachment"
 	}
 	header.Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": path.Base(f.Name)}))
-	if f.Restricted() || version != 0 {
+	switch {
+	case header.Get("Cache-Control") != "": // set by the caller
+	case f.Restricted() || version != 0:
 		header.Set("Cache-Control", "private, no-cache")
-	} else {
+	default:
 		header.Set("Cache-Control", "public, max-age=60, must-revalidate")
 	}
 	http.ServeContent(w, r, "", v.CreatedAt, obj)
@@ -369,10 +415,29 @@ func (h *Handler) create(r *http.Request, client, namespace, name string) (files
 	})
 }
 
-func (h *Handler) replace(r *http.Request, client, id string) (files.File, error) {
+func (h *Handler) replace(r *http.Request, client, id string, expected int) (files.File, error) {
 	return h.readUpload(r, func(u upload) (files.File, error) {
-		return h.files.Replace(r.Context(), id, files.ReplaceInput{ContentType: u.contentType, Body: u.body, Size: u.size, Client: client})
+		return h.files.Replace(r.Context(), id, files.ReplaceInput{ContentType: u.contentType, Body: u.body, Size: u.size, Client: client, ExpectedVersion: expected})
 	})
+}
+
+// apiFile resolves the {id} path value, which may be a file ID, a public URL
+// or "namespace/name" (URL-escaped).
+func (h *Handler) apiFile(r *http.Request) (files.File, error) {
+	return h.files.Resolve(r.Context(), r.PathValue("id"))
+}
+
+// queryInt reads an optional non-negative integer query parameter.
+func queryInt(r *http.Request, key string) (int, error) {
+	value := r.URL.Query().Get(key)
+	if value == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%w: %s must be a version number", files.ErrInvalid, key)
+	}
+	return n, nil
 }
 
 func (h *Handler) apiUpload(w http.ResponseWriter, r *http.Request) {
@@ -381,22 +446,114 @@ func (h *Handler) apiUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiReplace(w http.ResponseWriter, r *http.Request) {
-	f, err := h.replace(r, auth.ClientName(r.Context()), r.PathValue("id"))
+	expected, err := queryInt(r, "expected_version")
+	if err != nil {
+		respond(w, 0, nil, err)
+		return
+	}
+	f, err := h.apiFile(r)
+	if err == nil {
+		f, err = h.replace(r, auth.ClientName(r.Context()), f.ID, expected)
+	}
 	respond(w, http.StatusOK, f, err)
 }
 
 func (h *Handler) apiGet(w http.ResponseWriter, r *http.Request) {
-	f, err := h.files.Get(r.Context(), r.PathValue("id"))
+	f, err := h.apiFile(r)
+	respond(w, http.StatusOK, f, err)
+}
+
+// apiDownload returns the exact bytes of a version (?version=N, default
+// current), even for restricted or deleted files.
+func (h *Handler) apiDownload(w http.ResponseWriter, r *http.Request) {
+	version, err := queryInt(r, "version")
+	if err != nil {
+		respond(w, 0, nil, err)
+		return
+	}
+	f, err := h.apiFile(r)
+	if err != nil {
+		respond(w, 0, nil, err)
+		return
+	}
+	if f.Restricted() && countsAsView(r) {
+		h.audit(r, f, "view", "api", "", http.StatusOK, cmp.Or(version, f.Version))
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	h.send(w, r, f, version)
+}
+
+func (h *Handler) apiVersions(w http.ResponseWriter, r *http.Request) {
+	f, err := h.apiFile(r)
+	var versions []files.Version
+	if err == nil {
+		versions, err = h.files.Versions(r.Context(), f.ID)
+	}
+	respond(w, http.StatusOK, map[string]any{"versions": versions}, err)
+}
+
+func (h *Handler) apiRollback(w http.ResponseWriter, r *http.Request) {
+	version, err := queryInt(r, "version")
+	if err == nil && version == 0 {
+		err = fmt.Errorf("%w: ?version= is required", files.ErrInvalid)
+	}
+	var f files.File
+	if err == nil {
+		f, err = h.apiFile(r)
+	}
+	if err == nil {
+		f, err = h.files.Rollback(r.Context(), f.ID, version, auth.ClientName(r.Context()))
+	}
+	respond(w, http.StatusOK, f, err)
+}
+
+// fileUpdate is the PATCH body. Omitted fields are left alone. An empty
+// password removes the password; an empty allowed_emails list removes the
+// email restriction.
+type fileUpdate struct {
+	Name          *string   `json:"name"`
+	Password      *string   `json:"password"`
+	AllowedEmails *[]string `json:"allowed_emails"`
+}
+
+func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request) {
+	var in fileUpdate
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		respond(w, 0, nil, fmt.Errorf("%w: body must be JSON with name, password and/or allowed_emails: %v", files.ErrInvalid, err))
+		return
+	}
+	if in.Name == nil && in.Password == nil && in.AllowedEmails == nil {
+		respond(w, 0, nil, fmt.Errorf("%w: set at least one of name, password or allowed_emails", files.ErrInvalid))
+		return
+	}
+	f, err := h.apiFile(r)
+	if err == nil && in.AllowedEmails != nil {
+		f, err = h.files.SetAllowedEmails(r.Context(), f.ID, *in.AllowedEmails)
+	}
+	if err == nil && in.Password != nil {
+		f, err = h.files.SetPassword(r.Context(), f.ID, *in.Password)
+	}
+	if err == nil && in.Name != nil && *in.Name != f.Name {
+		f, err = h.files.Rename(r.Context(), f.ID, *in.Name)
+	}
 	respond(w, http.StatusOK, f, err)
 }
 
 func (h *Handler) apiDelete(w http.ResponseWriter, r *http.Request) {
-	f, err := h.files.Delete(r.Context(), r.PathValue("id"))
+	f, err := h.apiFile(r)
+	if err == nil {
+		f, err = h.files.Delete(r.Context(), f.ID)
+	}
 	respond(w, http.StatusOK, f, err)
 }
 
 func (h *Handler) apiRestore(w http.ResponseWriter, r *http.Request) {
-	f, err := h.files.Restore(r.Context(), r.PathValue("id"))
+	f, err := h.apiFile(r)
+	if err == nil {
+		f, err = h.files.Restore(r.Context(), f.ID)
+	}
 	respond(w, http.StatusOK, f, err)
 }
 
@@ -486,7 +643,7 @@ func StatusFor(err error) int {
 	switch {
 	case errors.Is(err, files.ErrNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, files.ErrExists):
+	case errors.Is(err, files.ErrExists), errors.Is(err, files.ErrConflict):
 		return http.StatusConflict
 	case errors.Is(err, files.ErrTooLarge), errors.As(err, &maxBytes):
 		return http.StatusRequestEntityTooLarge

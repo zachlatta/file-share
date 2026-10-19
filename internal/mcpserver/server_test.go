@@ -290,3 +290,20 @@ func TestAccessLogTool(t *testing.T) {
 		t.Fatalf("all: %+v", out.Events)
 	}
 }
+
+func TestReplaceWithExpectedVersion(t *testing.T) {
+	s := connect(t)
+	var f files.File
+	ok(t, call(t, s, "upload_file", map[string]any{"name": "db.json", "content_text": "{}"}), &f)
+	ok(t, call(t, s, "replace_file", map[string]any{"file": f.ID, "content_text": `{"a":1}`, "expected_version": 1}), &f)
+	res := call(t, s, "replace_file", map[string]any{"file": f.ID, "content_text": `{"b":1}`, "expected_version": 1})
+	if !res.IsError || !strings.Contains(text(res), "version 2") {
+		t.Fatalf("stale replace_file: %s", text(res))
+	}
+	res = call(t, s, "create_upload_url", map[string]any{"file": f.ID, "expected_version": 1})
+	if !res.IsError || !strings.Contains(text(res), "version 2") {
+		t.Fatalf("stale create_upload_url: %s", text(res))
+	}
+	var up uploadURLOutput
+	ok(t, call(t, s, "create_upload_url", map[string]any{"file": f.ID, "expected_version": 2}), &up)
+}

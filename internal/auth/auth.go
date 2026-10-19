@@ -337,13 +337,17 @@ func (s *Service) writeTokens(w http.ResponseWriter, r *http.Request, clientID, 
 	})
 }
 
-// RequireBearer protects the MCP endpoint with OAuth access tokens.
+// RequireBearer protects the MCP endpoint. It takes OAuth access tokens
+// from MCP clients, and the static "<client_name>:<secret>" bearer so scripts
+// can call tools without running the OAuth flow.
 func (s *Service) RequireBearer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, ok := bearer(r)
 		var claims signedPayload
 		if ok {
-			if err := s.verify(token, "access", &claims); err != nil || s.now().Unix() > claims.Exp {
+			if name, valid := s.staticClient(token); valid {
+				claims.ClientName = name
+			} else if err := s.verify(token, "access", &claims); err != nil || s.now().Unix() > claims.Exp {
 				ok = false
 			}
 		}
@@ -362,16 +366,24 @@ func (s *Service) RequireBearer(next http.Handler) http.Handler {
 func (s *Service) RequireStaticBearer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		credential, ok := bearer(r)
-		name, token, found := strings.Cut(credential, ":")
-		if ok && found {
-			if clean, valid := ValidateClientName(name); valid && s.CheckSecret(token) {
-				next.ServeHTTP(w, r.WithContext(WithClientName(r.Context(), clean)))
-				return
-			}
+		if name, valid := s.staticClient(credential); ok && valid {
+			next.ServeHTTP(w, r.WithContext(WithClientName(r.Context(), name)))
+			return
 		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="file-share", error="invalid_token"`)
 		http.Error(w, `unauthorized: send "Authorization: Bearer <client_name>:<secret>"`, http.StatusUnauthorized)
 	})
+}
+
+// staticClient checks a "<client_name>:<secret>" credential and returns the
+// client name.
+func (s *Service) staticClient(credential string) (string, bool) {
+	name, token, found := strings.Cut(credential, ":")
+	if !found {
+		return "", false
+	}
+	clean, valid := ValidateClientName(name)
+	return clean, valid && s.CheckSecret(token)
 }
 
 // SignUpload signs a URL token for the single-use upload link linkID, so an

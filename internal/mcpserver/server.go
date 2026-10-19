@@ -58,7 +58,8 @@ type UploadInput struct {
 }
 
 type ReplaceInput struct {
-	File string `json:"file" jsonschema:"The file: its ID, its public URL, or namespace/name."`
+	File            string `json:"file" jsonschema:"The file: its ID, its public URL, or namespace/name."`
+	ExpectedVersion int    `json:"expected_version,omitempty" jsonschema:"Optional: the version you read before editing (from get_file). The call fails, changing nothing, if the file has moved past it, so concurrent edits are never silently lost; then re-read, merge and retry."`
 	ContentInput
 }
 
@@ -118,12 +119,13 @@ type PurgeInput struct {
 }
 
 type UploadURLInput struct {
-	Name           string   `json:"name,omitempty" jsonschema:"Name for the new file. Omit to use the uploaded file's own name."`
-	Namespace      string   `json:"namespace,omitempty" jsonschema:"Existing namespace UUID for the new file. Omit for a new namespace."`
-	Password       string   `json:"password,omitempty" jsonschema:"Optional password visitors must enter to open the new file."`
-	AllowedEmails  []string `json:"allowed_emails,omitempty" jsonschema:"Optional: only these people can open the new file, after signing in with Hack Club Auth. Exact addresses, or '@domain.com' for a whole domain."`
-	File           string   `json:"file,omitempty" jsonschema:"To replace an existing file instead: its ID, URL or namespace/name. Its name, password and allowed emails are kept."`
-	ExpiresMinutes int      `json:"expires_minutes,omitempty" jsonschema:"How long the URL works if unused (default 60, max 1440)."`
+	Name            string   `json:"name,omitempty" jsonschema:"Name for the new file. Omit to use the uploaded file's own name."`
+	Namespace       string   `json:"namespace,omitempty" jsonschema:"Existing namespace UUID for the new file. Omit for a new namespace."`
+	Password        string   `json:"password,omitempty" jsonschema:"Optional password visitors must enter to open the new file."`
+	AllowedEmails   []string `json:"allowed_emails,omitempty" jsonschema:"Optional: only these people can open the new file, after signing in with Hack Club Auth. Exact addresses, or '@domain.com' for a whole domain."`
+	File            string   `json:"file,omitempty" jsonschema:"To replace an existing file instead: its ID, URL or namespace/name. Its name, password and allowed emails are kept."`
+	ExpectedVersion int      `json:"expected_version,omitempty" jsonschema:"With file: the version you read before editing. The upload is refused if the file has moved past it by then."`
+	ExpiresMinutes  int      `json:"expires_minutes,omitempty" jsonschema:"How long the URL works if unused (default 60, max 1440)."`
 }
 
 type DownloadURLInput struct {
@@ -196,7 +198,7 @@ func New(cfg Config) *mcp.Server {
 			"To share with specific people, set allowed_emails (or call set_allowed_emails): visitors sign in with Hack Club Auth and only those emails (or '@domain' entries) can open the file. "+
 			"A password is the alternative for people without a Hack Club account; if a file has both, either one opens it. "+
 			"Upload small files inline (content_text or content_base64), from the web (source_url), or for large or local files call create_upload_url and send the bytes with the curl it returns; that single-use URL needs no secret or API token. "+
-			"Replacing a file keeps its URL and adds a version. Deleted files and replaced versions are kept for %d days, "+
+			"Replacing a file keeps its URL and adds a version; if another agent may also edit it, pass expected_version (the version you read) so a concurrent edit is refused instead of overwritten. Deleted files and replaced versions are kept for %d days, "+
 			"during which restore_file and rollback_file can bring them back; after that they are purged. "+
 			"Files are referenced by ID, URL, or namespace/name.", cfg.Files.BaseURL(), cfg.Files.BaseURL(), days),
 	})
@@ -305,7 +307,7 @@ func (s *server) replace(ctx context.Context, in ReplaceInput) (files.File, erro
 		return files.File{}, err
 	}
 	defer closer()
-	return s.files.Replace(ctx, f.ID, files.ReplaceInput{ContentType: contentType, Body: body, Size: size, Client: client(ctx)})
+	return s.files.Replace(ctx, f.ID, files.ReplaceInput{ContentType: contentType, Body: body, Size: size, Client: client(ctx), ExpectedVersion: in.ExpectedVersion})
 }
 
 func (s *server) read(ctx context.Context, _ *mcp.CallToolRequest, in ReadInput) (*mcp.CallToolResult, readOutput, error) {
@@ -362,7 +364,7 @@ func (s *server) uploadURL(ctx context.Context, in UploadURLInput) (uploadURLOut
 	ttl := time.Duration(clamp(in.ExpiresMinutes, 60, 1440)) * time.Minute
 	link := files.UploadLinkInput{
 		Namespace: in.Namespace, Name: in.Name, Password: in.Password, AllowedEmails: in.AllowedEmails,
-		Client: client(ctx), ExpiresAt: time.Now().Add(ttl),
+		Client: client(ctx), ExpiresAt: time.Now().Add(ttl), ExpectedVersion: in.ExpectedVersion,
 	}
 	if in.File != "" {
 		f, err := s.files.Resolve(ctx, in.File)

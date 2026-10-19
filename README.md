@@ -26,7 +26,9 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
 - **Passwords.** Per-file passwords (bcrypt), for people without a Hack Club account. Visitors
   get a password page, and the unlock cookie is bound to the current password, so changing it
   locks out old sessions. Scripts can use `?password=` or HTTP Basic auth. If a file has both a
-  password and allowed emails, either one opens it.
+  password and allowed emails, either one opens it. Every wrong password, however it is sent,
+  is delayed, logged and counted: after 20 wrong guesses at one file in 15 minutes, password
+  attempts on it get `429` until the window ends. Visitors who already unlocked it keep access.
 - **Audit log and admin dashboard.** Every access to a password- or email-protected file is
   recorded: views (and how access was granted), visitors turned away at the gate, wrong
   passwords, and Hack Club sign-ins, with IP, country, user agent, referrer (query string
@@ -64,7 +66,9 @@ This is the same design as the personal data warehouse:
   The authorize page asks for a client name and for the server's pre-shared `MCP_SECRET`. Client
   IDs, codes, access tokens (24 h) and refresh tokens (1 year) are HMAC-signed with the secret,
   so auth needs no database. Rotating `MCP_SECRET` revokes everything.
-- **Scripts use a static bearer:** `Authorization: Bearer <client_name>:<MCP_SECRET>`.
+- **Scripts use a static bearer:** `Authorization: Bearer <client_name>:<MCP_SECRET>`. It works
+  on the HTTP API and on `/mcp`, so a script can call any tool with one JSON-RPC request and
+  no OAuth flow (see below).
 - **Signed upload and download URLs** carry their own expiring HMAC grant. An upload URL
   points at a single-use `upload_links` row that holds the link's settings and is claimed
   atomically, so it can be used once.
@@ -88,9 +92,23 @@ curl -H "$AUTH" -F file=@photo.jpg https://files.zachlatta.com/api/files        
 curl -H "$AUTH" --data-binary @notes.md "https://files.zachlatta.com/api/files?name=notes.md&namespace=<uuid>&password=pw"
 curl -H "$AUTH" -F file=@plan.pdf --form-string emails=zach@hackclub.com,@hackclub.com https://files.zachlatta.com/api/files  # share with people
 curl -H "$AUTH" -X PUT --data-binary @v2.jpg https://files.zachlatta.com/api/files/<id>/content   # replace
+curl -H "$AUTH" -X PUT --data-binary @v2.jpg "https://files.zachlatta.com/api/files/<id>/content?expected_version=1"  # replace only if still v1, else 409
+curl -H "$AUTH" -o out.jpg "https://files.zachlatta.com/api/files/<id>/content?version=1"  # exact bytes, even restricted or deleted
+curl -H "$AUTH" -X PATCH -d '{"allowed_emails":["max@hackclub.com"],"password":""}' https://files.zachlatta.com/api/files/<id>  # who can open it; "" removes the password, [] makes it public; also "name"
+curl -H "$AUTH" https://files.zachlatta.com/api/files/<id>/versions                    # history
+curl -H "$AUTH" -X POST "https://files.zachlatta.com/api/files/<id>/rollback?version=1"  # roll back
 curl -H "$AUTH" "https://files.zachlatta.com/api/files?q=photo&deleted=false"         # list
 curl -H "$AUTH" -X DELETE https://files.zachlatta.com/api/files/<id>                  # delete
 curl -H "$AUTH" -X POST https://files.zachlatta.com/api/files/<id>/restore            # restore
+```
+
+`<id>` may also be the URL-escaped `namespace%2Fname`. Any MCP tool works from a shell with the
+same bearer, as a single stateless JSON-RPC call:
+
+```sh
+curl -sS -H "$AUTH" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' https://files.zachlatta.com/mcp \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_access_log","arguments":{"limit":20}}}' \
+  | jq .result.structuredContent
 ```
 
 The same 100 MB per-request ceiling applies to `/api/files` through the public hostname. Use a

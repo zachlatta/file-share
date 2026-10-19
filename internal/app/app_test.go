@@ -202,3 +202,30 @@ func TestHackClubAuthWiring(t *testing.T) {
 		t.Fatalf("admin API: %d %s", rec.Code, rec.Body)
 	}
 }
+
+// A script can call any MCP tool with one curl: the static bearer and a
+// single JSON-RPC tools/call, no OAuth and no initialize handshake.
+func TestMCPToolCallWithStaticBearer(t *testing.T) {
+	server, _ := start(t)
+	call := func(authz, body string) (int, string) {
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", strings.NewReader(body))
+		req.Header.Set("Authorization", authz)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(data)
+	}
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"upload_file","arguments":{"name":"s.txt","content_text":"scripted"}}}`
+	status, out := call("Bearer script:"+secret, body)
+	if status != http.StatusOK || !strings.Contains(out, `"structuredContent"`) || !strings.Contains(out, `s.txt`) {
+		t.Fatalf("tools/call: %d %s", status, out)
+	}
+	if status, _ := call("Bearer script:wrong", body); status != http.StatusUnauthorized {
+		t.Fatalf("wrong secret: %d", status)
+	}
+}

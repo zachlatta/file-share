@@ -35,6 +35,7 @@ var (
 	ErrInvalid  = errors.New("invalid input")
 	ErrTooLarge = errors.New("file is larger than the upload limit")
 	ErrLinkUsed = errors.New("this upload link has already been used; create a new one")
+	ErrConflict = errors.New("the file changed since you read it")
 )
 
 type Config struct {
@@ -234,6 +235,9 @@ type ReplaceInput struct {
 	Size        int64
 	Client      string
 	Note        string
+	// ExpectedVersion, if set, is the version the caller started from. The
+	// replace fails with ErrConflict if the file is at any other version.
+	ExpectedVersion int
 }
 
 // Replace uploads new content for a live file as a new version. The URL,
@@ -246,11 +250,14 @@ func (s *Service) Replace(ctx context.Context, id string, in ReplaceInput) (File
 	if f.DeletedAt != nil {
 		return File{}, fmt.Errorf("%w: file is deleted; restore it first", ErrNotFound)
 	}
+	if err := checkVersion(f.Version, in.ExpectedVersion); err != nil {
+		return File{}, err // fail before sending the bytes
+	}
 	v, err := s.storeBlob(ctx, f.Name, in.ContentType, in.Body, in.Size)
 	if err != nil {
 		return File{}, err
 	}
-	if err := s.addVersion(ctx, f.ID, v, in.Client, in.Note); err != nil {
+	if err := s.addVersion(ctx, f.ID, v, in.Client, in.Note, in.ExpectedVersion); err != nil {
 		_ = s.blobs.Delete(context.WithoutCancel(ctx), v.blobKey)
 		return File{}, err
 	}
@@ -271,13 +278,22 @@ func (s *Service) Rollback(ctx context.Context, id string, number int, client st
 	if err != nil {
 		return File{}, err
 	}
-	if err := s.addVersion(ctx, f.ID, old, client, fmt.Sprintf("rollback to v%d", number)); err != nil {
+	if err := s.addVersion(ctx, f.ID, old, client, fmt.Sprintf("rollback to v%d", number), 0); err != nil {
 		return File{}, err
 	}
 	return s.Get(ctx, f.ID)
 }
 
-func (s *Service) addVersion(ctx context.Context, id string, v Version, client, note string) error {
+func checkVersion(current, expected int) error {
+	if expected != 0 && expected != current {
+		return fmt.Errorf("%w: it is at version %d, not %d; fetch the current version, merge your changes and retry", ErrConflict, current, expected)
+	}
+	return nil
+}
+
+// addVersion makes v the file's current version. expected, if set, must be
+// the current version, checked under the row lock.
+func (s *Service) addVersion(ctx context.Context, id string, v Version, client, note string, expected int) error {
 	now := s.nowUTC()
 	return pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		var current int
@@ -287,6 +303,9 @@ func (s *Service) addVersion(ctx context.Context, id string, v Version, client, 
 		}
 		if deleted != nil {
 			return fmt.Errorf("%w: file is deleted", ErrNotFound)
+		}
+		if err := checkVersion(current, expected); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE versions SET superseded_at = $3 WHERE file_id = $1 AND number = $2`, id, current, now); err != nil {
 			return err

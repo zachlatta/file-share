@@ -113,3 +113,30 @@ func TestUploadLinkValidationAndExpiry(t *testing.T) {
 		t.Fatalf("bad id: %v", err)
 	}
 }
+
+func TestReplaceLinkWithExpectedVersion(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	f := h.upload(t, "", "db.duckdb", "v1")
+	expires := h.clock.t.Add(time.Hour)
+	if _, err := h.svc.CreateUploadLink(ctx, UploadLinkInput{FileID: f.ID, ExpectedVersion: 2, ExpiresAt: expires}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("link for a version the file is not at: %v", err)
+	}
+	if _, err := h.svc.CreateUploadLink(ctx, UploadLinkInput{ExpectedVersion: 1, ExpiresAt: expires}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expected version on a new-file link: %v", err)
+	}
+	link, err := h.svc.CreateUploadLink(ctx, UploadLinkInput{FileID: f.ID, ExpectedVersion: 1, ExpiresAt: expires})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another writer gets in first.
+	if _, err := h.svc.Replace(ctx, f.ID, ReplaceInput{Body: strings.NewReader("v2"), Size: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.UploadWithLink(ctx, link.ID, LinkUpload{Body: strings.NewReader("stale"), Size: -1}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale link upload: %v", err)
+	}
+	if got := h.read(t, f, 0); got != "v2" {
+		t.Fatalf("current = %q", got)
+	}
+}

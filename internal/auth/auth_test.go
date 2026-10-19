@@ -366,3 +366,17 @@ func TestEmailSession(t *testing.T) {
 		t.Fatal("expired session accepted")
 	}
 }
+
+// Scripts can call /mcp with the same static bearer as the HTTP API, so they
+// never need to run the OAuth flow by hand.
+func TestMCPAcceptsStaticBearer(t *testing.T) {
+	_, mux, _ := newTestService(t)
+	if rec := callMCP(t, mux, "laptop:"+secret); rec.Code != http.StatusOK || rec.Body.String() != "client=laptop" {
+		t.Fatalf("static bearer on /mcp: %d %s", rec.Code, rec.Body)
+	}
+	for _, token := range []string{"laptop:wrong", secret, "bad:name:" + secret, ":" + secret} {
+		if rec := callMCP(t, mux, token); rec.Code != http.StatusUnauthorized {
+			t.Errorf("token %q: %d", token, rec.Code)
+		}
+	}
+}
