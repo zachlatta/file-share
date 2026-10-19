@@ -157,7 +157,10 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 			h.audit(r, f, "view", via, email, http.StatusOK, f.Version)
 		}
 	}
-	h.send(w, r, f, 0)
+	started := time.Now()
+	cw := &countingWriter{ResponseWriter: w}
+	h.send(cw, r, f, 0)
+	h.logRequest(r, f, cw, time.Since(started))
 }
 
 // unlock handles the password form.
@@ -262,7 +265,9 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request, f files.File, ver
 	header.Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": path.Base(f.Name)}))
 	switch {
 	case header.Get("Cache-Control") != "": // set by the caller
-	case f.Restricted() || version != 0:
+	case f.Restricted() || version != 0 || isMedia(v.ContentType):
+		// Media skips Cloudflare's cache so every range request reaches the
+		// request log, which is how listening is measured.
 		header.Set("Cache-Control", "private, no-cache")
 	default:
 		header.Set("Cache-Control", "public, max-age=60, must-revalidate")

@@ -11,7 +11,7 @@
 <body>
 <main id="login-view">
   <h1>file-share admin</h1>
-  <p class="hint">Sign in with the admin token to see who opened protected files.</p>
+  <p class="hint">Sign in with the admin token to see who opened protected files and what was listened to.</p>
   <form id="login-form" autocomplete="on">
     <input type="text" name="username" value="admin" autocomplete="username" hidden>
     <label for="token">Admin token</label>
@@ -36,6 +36,25 @@
       <tbody></tbody>
     </table></div>
     <p id="files-empty" class="hint" hidden>No files have a password or allowed emails.</p>
+  </section>
+
+  <section>
+    <h2>Listening</h2>
+    <p class="hint">Every file served. The bar shows which parts of each file went out (darker = more listeners). A player that downloads a whole episode shows a full bar whether or not it was played.</p>
+    <form id="listening-filters">
+      <input id="listening-namespace" type="search" placeholder="Namespace UUID (blank for all)" aria-label="Namespace">
+      <select id="listening-since" aria-label="Since">
+        <option value="7">Last 7 days</option>
+        <option value="30" selected>Last 30 days</option>
+        <option value="">All time</option>
+      </select>
+      <button type="submit">Show</button>
+    </form>
+    <div class="scroll"><table id="listening-table">
+      <thead><tr><th>File</th><th>Requests</th><th>Listeners</th><th>Full downloads</th><th>Sent</th><th>Last fetched</th><th>Parts sent</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <p id="listening-empty" class="hint" hidden>Nothing served in this window.</p>
   </section>
 
   <section>

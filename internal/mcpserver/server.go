@@ -113,6 +113,30 @@ type accessLogOutput struct {
 	Events []files.AccessEvent `json:"events"`
 }
 
+type RequestLogInput struct {
+	File      string `json:"file,omitempty" jsonschema:"Only requests for this file: its ID, public URL, or namespace/name."`
+	Namespace string `json:"namespace,omitempty" jsonschema:"Only requests for files in this namespace (UUID)."`
+	Search    string `json:"search,omitempty" jsonschema:"Case-insensitive substring of the IP, user agent or file name."`
+	Since     string `json:"since,omitempty" jsonschema:"Only requests at or after this RFC 3339 time."`
+	Before    int64  `json:"before,omitempty" jsonschema:"Only requests with an ID below this, for paging."`
+	Limit     int    `json:"limit,omitempty" jsonschema:"Max requests (default 200, max 1000)."`
+}
+
+type requestLogOutput struct {
+	Requests []files.FileRequest `json:"requests"`
+}
+
+type ListeningInput struct {
+	File      string `json:"file,omitempty" jsonschema:"Only this file: its ID, public URL, or namespace/name."`
+	Namespace string `json:"namespace,omitempty" jsonschema:"Only files in this namespace (UUID), for example a podcast feed's."`
+	Since     string `json:"since,omitempty" jsonschema:"Only requests at or after this RFC 3339 time."`
+	Buckets   int    `json:"buckets,omitempty" jsonschema:"How many equal slices coverage splits each file into (default 100)."`
+}
+
+type listeningOutput struct {
+	Files []files.FileListening `json:"files"`
+}
+
 type PurgeInput struct {
 	File    string `json:"file" jsonschema:"The file: its ID, its public URL, or namespace/name."`
 	Confirm bool   `json:"confirm" jsonschema:"Must be true. Purging is immediate and irreversible: all versions are destroyed."`
@@ -225,7 +249,9 @@ func New(cfg Config) *mcp.Server {
 	add(srv, "set_password", "Set or change the password visitors must enter to open a file. Old unlock cookies stop working.", updating, s.setPassword)
 	add(srv, "remove_password", "Remove a file's password so anyone with the link can open it.", updating, s.removePassword)
 	add(srv, "set_allowed_emails", "Set exactly who can open a file: visitors sign in with Hack Club Auth and must use one of these emails (or match an '@domain' entry). Replaces the whole list; an empty list removes the restriction. Takes effect immediately, including for people already signed in.", updating, s.setAllowedEmails)
-	add(srv, "get_access_log", "Audit log for password- and email-protected files, newest first: who viewed them (signed-in email, IP, country, user agent, referrer), who was turned away, wrong passwords and Hack Club sign-ins. Public files are not logged.", readOnly, s.accessLog)
+	add(srv, "get_access_log", "Audit log for password- and email-protected files, newest first: who viewed them (signed-in email, IP, country, user agent, referrer), who was turned away, wrong passwords and Hack Club sign-ins. Every served file, public or not, is in get_request_log.", readOnly, s.accessLog)
+	add(srv, "get_request_log", "Log of every file served (public or restricted), newest first: time, method, status, the byte range sent (range_start, bytes_sent, size), IP, country, user agent and referrer. Feed polls and podcast players show up here.", readOnly, s.requestLog)
+	add(srv, "get_listening", "Per file, who fetched which parts: requests, listeners (IP plus user agent), full downloads, and coverage, the number of listeners who received each slice of the file. For a constant-bitrate MP3 a slice is the same share of the running time, so this shows which sections of a podcast episode were streamed. A player that downloads the whole episode shows full coverage whether or not it was played.", readOnly, s.listening)
 	add(srv, "get_stats", "Totals (files, bytes, deleted files, namespaces), the retention window, and the upload size limit.", readOnly, s.stats)
 	return srv
 }
@@ -489,6 +515,61 @@ func (s *server) accessLog(ctx context.Context, in AccessLogInput) (accessLogOut
 		events = []files.AccessEvent{}
 	}
 	return accessLogOutput{Events: events}, err
+}
+
+func (s *server) fileID(ctx context.Context, ref string) (string, error) {
+	if id, err := uuid.Parse(strings.TrimSpace(ref)); err == nil {
+		return id.String(), nil // works for purged files too
+	} else if ref == "" {
+		return "", nil
+	}
+	f, err := s.files.Resolve(ctx, ref)
+	return f.ID, err
+}
+
+func parseSince(v string) (time.Time, error) {
+	if v == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}, errors.New("since must be an RFC 3339 time, like 2026-10-19T00:00:00Z")
+	}
+	return t, nil
+}
+
+func (s *server) requestLog(ctx context.Context, in RequestLogInput) (requestLogOutput, error) {
+	id, err := s.fileID(ctx, in.File)
+	if err != nil {
+		return requestLogOutput{}, err
+	}
+	since, err := parseSince(in.Since)
+	if err != nil {
+		return requestLogOutput{}, err
+	}
+	reqs, err := s.files.ListRequests(ctx, files.RequestQuery{FileID: id, Namespace: strings.TrimSpace(in.Namespace),
+		Search: in.Search, Since: since, Before: in.Before, Limit: in.Limit})
+	if reqs == nil {
+		reqs = []files.FileRequest{}
+	}
+	return requestLogOutput{Requests: reqs}, err
+}
+
+func (s *server) listening(ctx context.Context, in ListeningInput) (listeningOutput, error) {
+	id, err := s.fileID(ctx, in.File)
+	if err != nil {
+		return listeningOutput{}, err
+	}
+	since, err := parseSince(in.Since)
+	if err != nil {
+		return listeningOutput{}, err
+	}
+	list, err := s.files.Listening(ctx, files.ListeningQuery{FileID: id, Namespace: strings.TrimSpace(in.Namespace),
+		Since: since, Buckets: in.Buckets})
+	if list == nil {
+		list = []files.FileListening{}
+	}
+	return listeningOutput{Files: list}, err
 }
 
 func (s *server) purge(ctx context.Context, in PurgeInput) (okOutput, error) {

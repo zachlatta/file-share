@@ -52,7 +52,7 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
 | Area | Tools |
 | --- | --- |
 | Upload | `upload_file` (text, base64 or `source_url`), `create_upload_url`, `replace_file` |
-| Read | `read_file`, `create_download_url`, `get_file`, `list_files`, `list_versions`, `get_access_log`, `get_stats` |
+| Read | `read_file`, `create_download_url`, `get_file`, `list_files`, `list_versions`, `get_access_log`, `get_request_log`, `get_listening`, `get_stats` |
 | History | `rollback_file`, `delete_file`, `restore_file`, `purge_file` |
 | Manage | `rename_file`, `set_allowed_emails`, `set_password`, `remove_password` |
 
@@ -125,9 +125,23 @@ instead of this API, so they never need the secret.
   MapLibre map. This is safe because only the owner can upload, OAuth and the API never use
   ambient cookies, and password cookies are HttpOnly.
 
+## Request log and listening
+
+- Every file served from `/<ns>/<name>` adds a row to `file_requests`: time, method, status,
+  the first byte sent and how many bytes actually went out, the file size, IP, country, user
+  agent, referrer and duration. Query strings are never stored and referrers lose theirs.
+- Audio and video are sent with `Cache-Control: private, no-cache`, so Cloudflare does not
+  cache them and every range request a podcast player makes reaches the log.
+- `get_listening` (MCP) and `/admin` (Listening) merge each listener's byte ranges (a listener
+  is one IP and user agent) into coverage per slice of the file. For a constant-bitrate MP3 a
+  slice of bytes is the same slice of time, so this shows which sections were streamed. A
+  player that downloads a whole episode shows full coverage whether or not it was played;
+  no server can see playback inside a downloaded file.
+
 ## Storage
 
-- **PostgreSQL** holds metadata in two tables, `files` and `versions`. Migrations run at
+- **PostgreSQL** holds metadata (`files`, `versions`) and the logs (`access_events`,
+  `file_requests`). Migrations run at
   startup.
 - **S3-compatible object storage** holds bytes. Every version is written once under a random
   key and never modified. Rollback reuses the old version's object. A purge deletes an object

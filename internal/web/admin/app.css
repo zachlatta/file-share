@@ -14,8 +14,8 @@ button.secondary{background:var(--chip);color:var(--fg)}
 button.link{background:none;color:var(--accent);padding:0}
 .error{color:#c0392b}
 .hint{color:var(--muted);font-size:.9rem}
-#filters{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-bottom:.75rem}
-#search{min-width:18rem;flex:1}
+#filters,#listening-filters{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-bottom:.75rem}
+#search,#listening-namespace{min-width:18rem;flex:1}
 .chip{background:var(--chip);border-radius:999px;padding:.25rem .4rem .25rem .75rem}
 .chip button{background:none;color:var(--fg);padding:0 .3rem}
 .scroll{overflow-x:auto}
@@ -28,3 +28,5 @@ th{color:var(--muted);font-weight:600}
 .badge.denied,.badge.wrong_password,.badge.sign_in_failed{background:#fde2e1;color:#7f1d1d}
 a{color:var(--accent)}
 #more{margin-top:1rem}
+.coverage{display:flex;width:15rem;height:.9rem;border:1px solid var(--line)}
+.coverage span{flex:1;background:var(--accent)}

@@ -43,12 +43,6 @@ func (s *Service) RecordAccess(ctx context.Context, e AccessEvent) error {
 	if e.At.IsZero() {
 		e.At = s.nowUTC()
 	}
-	clip := func(v string, n int) string {
-		if len(v) > n {
-			return v[:n]
-		}
-		return v
-	}
 	_, err := s.db.Exec(ctx, `INSERT INTO access_events (at, file_id, namespace, name, version, event, via, email, ip, country,
 		user_agent, referer, remote_addr, forwarded_for, status)
 		VALUES ($1, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/zachlatta/file-share/internal/files"
 )
@@ -28,6 +29,7 @@ func (h *Handler) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/app.css", h.adminAsset("admin/app.css", "text/css; charset=utf-8"))
 	mux.Handle("GET /api/admin/access", h.requireAdmin(h.adminAccess))
 	mux.Handle("GET /api/admin/files", h.requireAdmin(h.adminFiles))
+	mux.Handle("GET /api/admin/listening", h.requireAdmin(h.adminListening))
 }
 
 func (h *Handler) adminAsset(name, contentType string) http.HandlerFunc {
@@ -90,6 +92,24 @@ func (h *Handler) adminFiles(w http.ResponseWriter, r *http.Request) {
 	list, err := h.files.RestrictedFiles(r.Context())
 	if list == nil {
 		list = []files.RestrictedFile{}
+	}
+	respond(w, http.StatusOK, map[string]any{"files": list}, err)
+}
+
+func (h *Handler) adminListening(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var since time.Time
+	if v := q.Get("since"); v != "" {
+		var err error
+		if since, err = time.Parse(time.RFC3339, v); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "since must be an RFC 3339 time"})
+			return
+		}
+	}
+	buckets, _ := strconv.Atoi(q.Get("buckets"))
+	list, err := h.files.Listening(r.Context(), files.ListeningQuery{FileID: q.Get("file"), Namespace: q.Get("namespace"), Since: since, Buckets: buckets})
+	if list == nil {
+		list = []files.FileListening{}
 	}
 	respond(w, http.StatusOK, map[string]any{"files": list}, err)
 }

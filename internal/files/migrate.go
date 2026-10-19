@@ -80,6 +80,29 @@ var migrations = []string{
 	CREATE INDEX upload_links_expires ON upload_links (expires_at);`,
 	// A replace link can name the version it expects to replace.
 	`ALTER TABLE upload_links ADD COLUMN expected_version integer NOT NULL DEFAULT 0;`,
+	// Every file served, public or restricted, with the byte range sent, so
+	// podcast and video listening can be reconstructed. Like access_events,
+	// no foreign key: the log outlives the file.
+	`CREATE TABLE file_requests (
+		id bigserial PRIMARY KEY,
+		at timestamptz NOT NULL,
+		file_id uuid,
+		namespace uuid,
+		name text NOT NULL DEFAULT '',
+		version integer NOT NULL DEFAULT 0,
+		method text NOT NULL DEFAULT '',
+		status integer NOT NULL DEFAULT 0,
+		range_start bigint NOT NULL DEFAULT 0,
+		bytes_sent bigint NOT NULL DEFAULT 0,
+		size bigint NOT NULL DEFAULT 0,
+		ip text NOT NULL DEFAULT '',
+		country text NOT NULL DEFAULT '',
+		user_agent text NOT NULL DEFAULT '',
+		referer text NOT NULL DEFAULT '',
+		duration_ms integer NOT NULL DEFAULT 0
+	);
+	CREATE INDEX file_requests_file ON file_requests (file_id, id DESC);
+	CREATE INDEX file_requests_namespace ON file_requests (namespace, id DESC);`,
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {

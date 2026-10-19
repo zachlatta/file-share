@@ -158,7 +158,7 @@ func TestAdminAPI(t *testing.T) {
 	e.do(visitor(http.MethodGet, urlPath(f), ""))
 	e.do(visitor(http.MethodGet, urlPath(f)+"?password=pw-123", ""))
 
-	for _, path := range []string{"/api/admin/access", "/api/admin/files"} {
+	for _, path := range []string{"/api/admin/access", "/api/admin/files", "/api/admin/listening"} {
 		for _, token := range []string{"", "wrong", secret, "curl:" + secret} {
 			if rec := adminGet(e, path, token); rec.Code != http.StatusUnauthorized {
 				t.Errorf("%s with %q: %d", path, token, rec.Code)

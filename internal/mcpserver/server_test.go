@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -98,7 +99,7 @@ func TestCatalog(t *testing.T) {
 	}
 	for _, want := range []string{"upload_file", "create_upload_url", "replace_file", "read_file", "create_download_url",
 		"get_file", "list_files", "list_versions", "rollback_file", "rename_file", "delete_file", "restore_file",
-		"purge_file", "set_password", "remove_password", "set_allowed_emails", "get_access_log", "get_stats"} {
+		"purge_file", "set_password", "remove_password", "set_allowed_emails", "get_access_log", "get_request_log", "get_listening", "get_stats"} {
 		if !slices.Contains(names, want) {
 			t.Errorf("missing tool %s", want)
 		}
@@ -288,6 +289,32 @@ func TestAccessLogTool(t *testing.T) {
 	ok(t, call(t, s, "get_access_log", map[string]any{}), &out)
 	if len(out.Events) != 2 {
 		t.Fatalf("all: %+v", out.Events)
+	}
+}
+
+func TestRequestLogAndListeningTools(t *testing.T) {
+	s, svc := connectWithService(t)
+	var f files.File
+	ok(t, call(t, s, "upload_file", map[string]any{"name": "ep.mp3", "content_text": strings.Repeat("a", 100)}), &f)
+	_ = svc.RecordRequest(t.Context(), files.FileRequest{FileID: f.ID, Namespace: f.Namespace, Name: f.Name, Method: "GET",
+		Status: 206, RangeStart: 50, BytesSent: 50, Size: 100, IP: "203.0.113.9", UserAgent: "AppleCoreMedia/1.0"})
+	var log struct {
+		Requests []files.FileRequest `json:"requests"`
+	}
+	ok(t, call(t, s, "get_request_log", map[string]any{"file": f.URL}), &log)
+	if len(log.Requests) != 1 || log.Requests[0].RangeStart != 50 {
+		t.Fatalf("log: %+v", log.Requests)
+	}
+	ok(t, call(t, s, "get_request_log", map[string]any{"namespace": f.Namespace, "since": "2999-01-01T00:00:00Z"}), &log)
+	if len(log.Requests) != 0 {
+		t.Fatalf("since: %+v", log.Requests)
+	}
+	var out struct {
+		Files []files.FileListening `json:"files"`
+	}
+	ok(t, call(t, s, "get_listening", map[string]any{"namespace": f.Namespace, "buckets": 4}), &out)
+	if len(out.Files) != 1 || out.Files[0].Listeners != 1 || fmt.Sprint(out.Files[0].Coverage) != "[0 0 1 1]" {
+		t.Fatalf("listening: %+v", out.Files)
 	}
 }
 

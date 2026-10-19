@@ -46,6 +46,7 @@
     }
     $("login-view").hidden = true;
     $("dashboard").hidden = false;
+    await loadListening();
     await loadLog(false);
   }
 
@@ -89,6 +90,45 @@
     $("files-empty").hidden = data.files.length > 0;
   }
 
+  const size = (n) => {
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return (i ? n.toFixed(1) : n) + " " + units[i];
+  };
+
+  async function loadListening() {
+    const params = new URLSearchParams({ buckets: "50" });
+    const ns = $("listening-namespace").value.trim();
+    if (ns) params.set("namespace", ns);
+    const days = $("listening-since").value;
+    if (days) params.set("since", new Date(Date.now() - Number(days) * 86400000).toISOString().replace(/\.\d+Z$/, "Z"));
+    const data = await api("/api/admin/listening?" + params);
+    const body = $("listening-table").tBodies[0];
+    body.replaceChildren();
+    for (const f of data.files) {
+      const row = el("tr");
+      const bar = el("td");
+      const strip = el("div", null, "coverage");
+      const most = Math.max(1, ...f.coverage);
+      f.coverage.forEach((n, i) => {
+        const cell = el("span");
+        // CSSOM writes are allowed under style-src 'self'.
+        cell.style.opacity = n ? String(0.2 + 0.8 * (n / most)) : "0.05";
+        cell.title = Math.round((i / f.coverage.length) * 100) + "%: " + n + " listener" + (n === 1 ? "" : "s");
+        strip.append(cell);
+      });
+      bar.append(strip);
+      const who = f.listeners_detail.map((l) => l.user_agent + " · " + l.ip + " · " + Math.round(l.covered * 100) + "%").join("\n");
+      const listeners = el("td", f.listeners);
+      listeners.title = who;
+      row.append(el("td", f.name || f.file_id, "wrap"), el("td", f.requests), listeners, el("td", f.full_downloads),
+        el("td", size(f.bytes_served)), el("td", when(f.last_at)), bar);
+      body.append(row);
+    }
+    $("listening-empty").hidden = data.files.length > 0;
+  }
+
   async function loadLog(append) {
     const params = new URLSearchParams({ limit: "200" });
     if ($("event-filter").value) params.set("event", $("event-filter").value);
@@ -122,7 +162,9 @@
   document.addEventListener("DOMContentLoaded", () => {
     $("login-form").addEventListener("submit", signIn);
     $("logout").addEventListener("click", () => showLogin(""));
-    $("refresh").addEventListener("click", () => guarded(async () => { await loadFiles(); await loadLog(false); }));
+    $("refresh").addEventListener("click", () => guarded(async () => { await loadFiles(); await loadListening(); await loadLog(false); }));
+    $("listening-filters").addEventListener("submit", (event) => { event.preventDefault(); guarded(loadListening); });
+    $("listening-since").addEventListener("change", () => guarded(loadListening));
     $("filters").addEventListener("submit", (event) => { event.preventDefault(); guarded(() => loadLog(false)); });
     $("event-filter").addEventListener("change", () => guarded(() => loadLog(false)));
     $("clear-file").addEventListener("click", () => { fileFilter = null; guarded(() => loadLog(false)); });
