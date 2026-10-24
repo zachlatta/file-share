@@ -173,10 +173,15 @@ public file can never be made from something only the server can reach.
 ## Development
 
 ```sh
-cp .env.example .env
-make test   # gofmt check, go vet, go test -race ./...
+make dev-env    # .env from .env.example, with a fresh MCP_SECRET
+make dev-deps   # PostgreSQL and Garage on loopback (compose.dev.yaml)
+make test       # gofmt check, go vet, go test -race ./...
 make run
 ```
+
+`paseo.json` sets up the same thing for Paseo: a new worktree copies `.env` from the main
+checkout (or runs `make dev-env`), and the `serve` script starts the dependencies and the server
+on the port Paseo assigns.
 
 Tests use real PostgreSQL. Set `FILE_SHARE_TEST_DATABASE_URL`, or have `initdb`/`pg_ctl` on the
 machine and the tests start a throwaway cluster. CI uses a Postgres service container. S3 is

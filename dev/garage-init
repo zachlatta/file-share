@@ -1,0 +1,21 @@
+#!/bin/sh
+# Give the local Garage node a layout, the development key and the bucket that
+# .env.example names. Safe to run again: it stops once the bucket exists.
+set -eu
+
+garage() { docker compose -f compose.dev.yaml exec -T -e RUST_LOG=warn garage /garage "$@"; }
+
+if garage bucket info file-share >/dev/null 2>&1; then
+  exit 0
+fi
+
+node_id=$(garage node id -q | cut -d@ -f1)
+if ! garage layout show | grep -q "$(printf '%.16s' "$node_id")"; then
+  garage layout assign -z dev -c 1G "$node_id" >/dev/null
+  garage layout apply --version 1 >/dev/null
+fi
+garage key import --yes -n file-share-dev \
+  GK0123456789abcdef01234567 \
+  0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef >/dev/null
+garage bucket create file-share >/dev/null
+garage bucket allow --read --write --owner file-share --key file-share-dev >/dev/null

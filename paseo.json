@@ -1,0 +1,15 @@
+{
+  "worktree": {
+    "setup": "if [ -f \"$PASEO_SOURCE_CHECKOUT_PATH/.env\" ]; then cp \"$PASEO_SOURCE_CHECKOUT_PATH/.env\" .env; else make dev-env; fi\ngo mod download"
+  },
+  "scripts": {
+    "test": {
+      "command": "make test"
+    },
+    "serve": {
+      "type": "service",
+      "command": "make dev-deps && ADDR=127.0.0.1:$PASEO_PORT PUBLIC_URL=http://127.0.0.1:$PASEO_PORT go run ./cmd/file-share serve",
+      "port": 8080
+    }
+  }
+}

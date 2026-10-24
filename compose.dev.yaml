@@ -1,0 +1,30 @@
+# Local dependencies for `make run` and the Paseo `serve` script: PostgreSQL for
+# metadata and Garage (the object store production uses) for file bytes.
+# Development only: everything listens on loopback, and dev/garage.toml and
+# dev/garage-init use throwaway credentials that match .env.example.
+name: file-share-dev
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: file_share
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: [postgres:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30
+  garage:
+    image: dxflrs/garage:v2.1.0
+    ports: ["127.0.0.1:3900:3900"]
+    volumes:
+      - ./dev/garage.toml:/etc/garage.toml:ro
+      - garage:/var/lib/garage
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 2s
+      retries: 30
+volumes:
+  postgres:
+  garage:
