@@ -385,11 +385,35 @@ func TestSignedDownloadURL(t *testing.T) {
 func TestHealthAndHome(t *testing.T) {
 	e := newEnv(t)
 	rec := e.do(httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"storage":"ok"`) {
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"storage":"ok"`) || !strings.Contains(rec.Body.String(), `"status":"ok"`) {
 		t.Fatalf("healthz: %d %s", rec.Code, rec.Body)
 	}
 	if rec := e.do(httptest.NewRequest(http.MethodGet, "/", nil)); rec.Code != 200 {
 		t.Fatalf("home: %d", rec.Code)
+	}
+}
+
+// downStore is a blob store whose backend is unreachable.
+type downStore struct{ *blob.Memory }
+
+func (downStore) Ping(context.Context) error { return fmt.Errorf("connection refused") }
+
+func TestHealthReportsDegradedStorage(t *testing.T) {
+	svc, err := files.Open(context.Background(), files.Config{
+		DatabaseURL: pgtest.New(t), Blobs: downStore{blob.NewMemory()}, BaseURL: "https://files.example.com",
+		Retention: 30 * 24 * time.Hour, MaxBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(svc.Close)
+	mux := http.NewServeMux()
+	New(Config{Files: svc, Auth: auth.NewService(auth.Config{Secret: secret, BaseURL: "https://files.example.com"}), Version: "test"}).Register(mux)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	// Still 200 so the container is not restarted, but the body must not claim "ok".
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"status":"degraded"`) || !strings.Contains(rec.Body.String(), "connection refused") {
+		t.Fatalf("healthz with storage down: %d %s", rec.Code, rec.Body)
 	}
 }
 

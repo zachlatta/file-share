@@ -99,13 +99,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	storage := "ok"
+	status, storage := "ok", "ok"
 	if err := h.files.Ping(ctx); err != nil {
-		storage = err.Error()
+		status, storage = "degraded", err.Error()
 	}
 	// Always 200: the process is alive even if the NAS is briefly away, and
-	// restarting the container would not help.
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": h.version, "storage": storage})
+	// restarting the container would not help. The status still says so.
+	writeJSON(w, http.StatusOK, map[string]any{"status": status, "version": h.version, "storage": storage})
 }
 
 func (h *Handler) home(w http.ResponseWriter, _ *http.Request) {

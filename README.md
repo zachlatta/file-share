@@ -43,7 +43,9 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
   retry, and an unused link expires (default 60 minutes, max 24 hours). Cloudflare rejects
   request bodies over 100 MB, so bigger files go up in parts: `PUT <url>?part=1..N` (each part
   90 MB or less), then `POST <url>?complete=N` (plus `&name=` if the link has no name). The tool
-  returns a ready-made `curl_chunked` script. Unfinished parts are deleted after 24 hours.
+  returns a ready-made `curl_chunked` script. Pass `local_path` and both commands name your file,
+  so they run as is; without it they use a `./LOCAL_FILE` placeholder. Unfinished parts are
+  deleted after 24 hours.
   `create_download_url` does the same for downloads, including old versions, password-protected
   files and deleted files.
 
@@ -192,5 +194,6 @@ bucket.
 ## Deployment
 
 The `Dockerfile` builds a static binary on Alpine with a `/healthz` check. `/healthz` always
-returns 200 and reports `storage` as `ok` or the error, so a brief object-store outage never
-causes restart loops. The container is stateless; mount nothing.
+returns 200, so a brief object-store outage never causes restart loops. When storage is
+unreachable, `status` is `degraded` and `storage` holds the error; otherwise both are `ok`.
+The container is stateless; mount nothing.

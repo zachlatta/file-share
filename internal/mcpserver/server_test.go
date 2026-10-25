@@ -217,6 +217,14 @@ func TestSignedURLsAndSourceURL(t *testing.T) {
 		!up.SingleUse || up.URL != "https://files.example.com/"+up.Namespace+"/big.mov" {
 		t.Fatalf("upload url = %+v", up)
 	}
+	if !strings.Contains(up.Curl, "-F 'file=@./LOCAL_FILE' ") || !strings.HasPrefix(up.CurlChunked, "f=./LOCAL_FILE; ") {
+		t.Fatalf("without local_path the commands need a placeholder: %+v", up)
+	}
+	ok(t, call(t, s, "create_upload_url", map[string]any{"local_path": "/tmp/it's here/big.mov"}), &up)
+	if !strings.Contains(up.Curl, `-F 'file=@/tmp/it'\''s here/big.mov'`) || !strings.Contains(up.CurlChunked, `f='/tmp/it'\''s here/big.mov';`) ||
+		strings.Contains(up.Curl+up.CurlChunked, "LOCAL_FILE") {
+		t.Fatalf("local_path not filled in, shell-quoted: %+v", up)
+	}
 	if res := call(t, s, "create_upload_url", map[string]any{"name": "x.txt", "allowed_emails": []string{"nope"}}); !res.IsError {
 		t.Fatal("bad allowed_emails accepted")
 	}
