@@ -14,11 +14,13 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -101,11 +103,32 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	status, storage := "ok", "ok"
 	if err := h.files.Ping(ctx); err != nil {
-		status, storage = "degraded", err.Error()
+		h.logger.Warn("health check failed", "error", err)
+		status, storage = "degraded", healthProblem(err)
 	}
 	// Always 200: the process is alive even if the NAS is briefly away, and
 	// restarting the container would not help. The status still says so.
 	writeJSON(w, http.StatusOK, map[string]any{"status": status, "version": h.version, "storage": storage})
+}
+
+// healthProblem names the failed dependency and a coarse cause. /healthz is
+// public, so the raw error, which holds private addresses and the bucket
+// name, only goes to the server log.
+func healthProblem(err error) string {
+	component := "storage"
+	var pe *files.PingError
+	if errors.As(err, &pe) {
+		component = pe.Component
+	}
+	var netErr net.Error
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return component + ": connection refused"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return component + ": timed out"
+	default:
+		return component + ": unavailable"
+	}
 }
 
 func (h *Handler) home(w http.ResponseWriter, _ *http.Request) {

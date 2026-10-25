@@ -195,5 +195,8 @@ bucket.
 
 The `Dockerfile` builds a static binary on Alpine with a `/healthz` check. `/healthz` always
 returns 200, so a brief object-store outage never causes restart loops. When storage is
-unreachable, `status` is `degraded` and `storage` holds the error; otherwise both are `ok`.
+unreachable, `status` is `degraded` and `storage` names the failed part and a coarse cause
+(for example `object store: connection refused`, `postgres: timed out`); otherwise both are
+`ok`. `/healthz` is public, so the full error, with addresses and the bucket name, goes only to
+the server log (`health check failed`).
 The container is stateless; mount nothing.

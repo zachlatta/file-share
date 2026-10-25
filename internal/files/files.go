@@ -134,13 +134,23 @@ func (s *Service) Retention() time.Duration { return s.retention }
 func (s *Service) MaxBytes() int64          { return s.maxBytes }
 func (s *Service) BaseURL() string          { return s.baseURL }
 
-// Ping checks the database and the blob store.
+// PingError says which dependency failed a health check.
+type PingError struct {
+	// Component is "postgres" or "object store".
+	Component string
+	Err       error
+}
+
+func (e *PingError) Error() string { return e.Component + ": " + e.Err.Error() }
+func (e *PingError) Unwrap() error { return e.Err }
+
+// Ping checks the database and the blob store. A failure is a *PingError.
 func (s *Service) Ping(ctx context.Context) error {
 	if err := s.db.Ping(ctx); err != nil {
-		return fmt.Errorf("postgres: %w", err)
+		return &PingError{Component: "postgres", Err: err}
 	}
 	if err := s.blobs.Ping(ctx); err != nil {
-		return fmt.Errorf("object store: %w", err)
+		return &PingError{Component: "object store", Err: err}
 	}
 	return nil
 }

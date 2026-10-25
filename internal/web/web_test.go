@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -393,10 +396,16 @@ func TestHealthAndHome(t *testing.T) {
 	}
 }
 
-// downStore is a blob store whose backend is unreachable.
+// downStore is a blob store whose backend is unreachable. Its error names a
+// private address and the bucket, as the S3 client's does.
 type downStore struct{ *blob.Memory }
 
-func (downStore) Ping(context.Context) error { return fmt.Errorf("connection refused") }
+func (downStore) Ping(context.Context) error {
+	return &url.Error{Op: "Head", URL: "http://100.64.0.7:3900/secret-bucket/", Err: &net.OpError{
+		Op: "dial", Net: "tcp", Addr: &net.TCPAddr{IP: net.ParseIP("100.64.0.7"), Port: 3900},
+		Err: os.NewSyscallError("connect", syscall.ECONNREFUSED),
+	}}
+}
 
 func TestHealthReportsDegradedStorage(t *testing.T) {
 	svc, err := files.Open(context.Background(), files.Config{
@@ -412,8 +421,15 @@ func TestHealthReportsDegradedStorage(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	// Still 200 so the container is not restarted, but the body must not claim "ok".
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"status":"degraded"`) || !strings.Contains(rec.Body.String(), "connection refused") {
-		t.Fatalf("healthz with storage down: %d %s", rec.Code, rec.Body)
+	body := rec.Body.String()
+	if rec.Code != 200 || !strings.Contains(body, `"status":"degraded"`) || !strings.Contains(body, `"storage":"object store: connection refused"`) {
+		t.Fatalf("healthz with storage down: %d %s", rec.Code, body)
+	}
+	// /healthz is public: it says which part is down, never where it lives.
+	for _, leak := range []string{"100.64.0.7", "3900", "secret-bucket"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("healthz leaks %q: %s", leak, body)
+		}
 	}
 }
 
