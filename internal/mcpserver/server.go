@@ -51,7 +51,7 @@ type ContentInput struct {
 
 type UploadInput struct {
 	Name          string   `json:"name,omitempty" jsonschema:"File name, which becomes the last part of the URL. May contain '/' to make folders. Defaults to the source_url's file name."`
-	Namespace     string   `json:"namespace,omitempty" jsonschema:"Existing namespace UUID to add this file to (to group files, e.g. a small website). Omit to create a new unguessable namespace."`
+	Namespace     string   `json:"namespace,omitempty" jsonschema:"Existing namespace to add this file to (to group files, e.g. a small website): the namespace UUID or URL of an earlier upload. Omit to create a new unguessable namespace; you cannot choose a new one."`
 	Password      string   `json:"password,omitempty" jsonschema:"Optional password visitors must enter to open the file."`
 	AllowedEmails []string `json:"allowed_emails,omitempty" jsonschema:"Optional: only these people can open the file, after signing in with Hack Club Auth. Exact addresses, or '@domain.com' for a whole domain. Preferred over a password for sharing with specific people."`
 	ContentInput
@@ -144,7 +144,7 @@ type PurgeInput struct {
 
 type UploadURLInput struct {
 	Name            string   `json:"name,omitempty" jsonschema:"Name for the new file. Omit to use the uploaded file's own name."`
-	Namespace       string   `json:"namespace,omitempty" jsonschema:"Existing namespace UUID for the new file. Omit for a new namespace."`
+	Namespace       string   `json:"namespace,omitempty" jsonschema:"Existing namespace for the new file: the namespace UUID or URL of an earlier upload. Omit for a new namespace; you cannot choose a new one."`
 	Password        string   `json:"password,omitempty" jsonschema:"Optional password visitors must enter to open the new file."`
 	AllowedEmails   []string `json:"allowed_emails,omitempty" jsonschema:"Optional: only these people can open the new file, after signing in with Hack Club Auth. Exact addresses, or '@domain.com' for a whole domain."`
 	File            string   `json:"file,omitempty" jsonschema:"To replace an existing file instead: its ID, URL or namespace/name. Its name, password and allowed emails are kept."`

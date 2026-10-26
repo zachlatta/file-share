@@ -17,8 +17,9 @@ import (
 // only supplies the bytes and, when the link has no name, the file name.
 
 type UploadLinkInput struct {
-	// Namespace is an existing namespace UUID, or empty for a new one. The
-	// namespace is chosen when the link is made, so its URL is known early.
+	// Namespace is an existing namespace (its UUID or URL), or empty for a
+	// new one. The namespace is chosen when the link is made, so its URL is
+	// known early.
 	Namespace string
 	// Name is the file name, or empty to take it from the upload.
 	Name string
@@ -85,15 +86,14 @@ func (s *Service) CreateUploadLink(ctx context.Context, in UploadLinkInput) (Upl
 			}
 			link.Name = name
 		}
-		link.Namespace = uuid.NewString()
-		if in.Namespace != "" {
-			ns, err := uuid.Parse(in.Namespace)
-			if err != nil {
-				return UploadLink{}, fmt.Errorf("%w: namespace must be a UUID", ErrInvalid)
-			}
-			link.Namespace = ns.String()
+		ns, err := s.existingNamespace(ctx, in.Namespace)
+		if err != nil {
+			return UploadLink{}, err
 		}
-		var err error
+		link.Namespace = ns
+		if ns == "" {
+			link.Namespace = uuid.NewString()
+		}
 		if emails, err = s.cleanEmails(in.AllowedEmails); err != nil {
 			return UploadLink{}, err
 		}

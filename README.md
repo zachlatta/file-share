@@ -10,7 +10,8 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
 ```
 
 - **Unguessable URLs.** Each upload gets a fresh random UUIDv4 namespace unless you pass an
-  existing one, so you can group files (a tiny static site, a folder of photos) under one prefix.
+  existing one (its UUID or URL), so you can group files (a tiny static site, a folder of photos)
+  under one prefix. A namespace that holds no file is refused, so you cannot pick a guessable one.
   There is no index or listing anywhere public.
 - **Version history.** Replacing a file keeps its URL and adds a version. Older versions stay
   readable and can be rolled back.

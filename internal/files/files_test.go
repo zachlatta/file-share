@@ -3,6 +3,7 @@ package files
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"strings"
@@ -132,6 +133,48 @@ func TestUploadIntoExistingNamespace(t *testing.T) {
 	list, err := h.svc.List(context.Background(), ListOptions{Namespace: a.Namespace})
 	if err != nil || len(list) != 2 {
 		t.Fatalf("list namespace: %d %v", len(list), err)
+	}
+}
+
+// A caller cannot pick a namespace of its own, because a chosen UUID (all
+// zeros, or a non-random version) could be guessed. Only namespaces the
+// server generated, which hold a file, live or deleted, are accepted.
+func TestUploadNamespaceMustExist(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	for _, ns := range []string{uuid.NewString(), "00000000-0000-0000-0000-000000000000"} {
+		_, err := h.svc.Upload(ctx, UploadInput{Namespace: ns, Name: "x.txt", Body: strings.NewReader("x"), Size: -1})
+		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "omit namespace") {
+			t.Fatalf("unknown namespace %s: %v", ns, err)
+		}
+	}
+	_, err := h.svc.Upload(ctx, UploadInput{Namespace: "my-review-shots", Name: "x.txt", Body: strings.NewReader("x"), Size: -1})
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "omit namespace") {
+		t.Fatalf("non-UUID namespace: %v", err)
+	}
+	if _, err := h.svc.CreateUploadLink(ctx, UploadLinkInput{Namespace: uuid.NewString(), ExpiresAt: h.clock.t.Add(time.Hour)}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("upload link to unknown namespace: %v", err)
+	}
+
+	// The namespace's URL, or any file URL in it, names it too.
+	a := h.upload(t, "", "index.html", "<h1>hi</h1>")
+	for i, ns := range []string{a.URL, "https://files.example.com/" + a.Namespace + "/", strings.ToUpper(a.Namespace), a.Namespace + "/"} {
+		f := h.upload(t, ns, fmt.Sprintf("by-url-%d.txt", i), "x")
+		if f.Namespace != a.Namespace {
+			t.Fatalf("%q: namespace %s, want %s", ns, f.Namespace, a.Namespace)
+		}
+	}
+	if _, err := h.svc.Upload(ctx, UploadInput{Namespace: "https://elsewhere.example/" + a.Namespace + "/", Name: "y.txt", Body: strings.NewReader("y"), Size: -1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("another host's URL: %v", err)
+	}
+
+	// A namespace whose only file is soft-deleted still exists.
+	b := h.upload(t, "", "only.txt", "x")
+	if _, err := h.svc.Delete(ctx, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if f := h.upload(t, b.Namespace, "again.txt", "x"); f.Namespace != b.Namespace {
+		t.Fatalf("namespace of a deleted file: %+v", f)
 	}
 }
 

@@ -167,7 +167,8 @@ func (s *Service) URLFor(namespace, name string) string {
 }
 
 type UploadInput struct {
-	// Namespace is an existing namespace UUID, or empty for a new one.
+	// Namespace is an existing namespace (its UUID or URL), or empty for a
+	// new one.
 	Namespace   string
 	Name        string
 	ContentType string
@@ -182,9 +183,13 @@ type UploadInput struct {
 }
 
 func (s *Service) Upload(ctx context.Context, in UploadInput) (File, error) {
+	ns, err := s.existingNamespace(ctx, in.Namespace)
+	if err != nil {
+		return File{}, err
+	}
+	in.Namespace = ns
 	var hash string
 	if in.Password != "" {
-		var err error
 		if hash, err = hashPassword(in.Password); err != nil {
 			return File{}, err
 		}
@@ -192,8 +197,33 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (File, error) {
 	return s.upload(ctx, in, hash)
 }
 
+// existingNamespace resolves a namespace a caller asked to upload into: its
+// UUID, its URL or any file URL in it. It must already hold a file, live or
+// deleted, so every namespace is one the server generated at random; a
+// caller-chosen UUID could be guessed. "" stays "" (a new namespace).
+func (s *Service) existingNamespace(ctx context.Context, ref string) (string, error) {
+	if ref == "" {
+		return "", nil
+	}
+	raw := strings.TrimPrefix(ref, s.baseURL+"/")
+	raw, _, _ = strings.Cut(raw, "/")
+	parsed, err := uuid.Parse(raw)
+	if err != nil || strings.Contains(raw, ":") {
+		return "", fmt.Errorf("%w: namespace %q is not a namespace UUID; pass the \"namespace\" of an earlier upload, or omit namespace to get a new one", ErrInvalid, ref)
+	}
+	ns := parsed.String()
+	var exists bool
+	if err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM files WHERE namespace = $1)`, ns).Scan(&exists); err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf("%w: namespace %s has no files; pass the \"namespace\" of an earlier upload, or omit namespace to get a new one", ErrInvalid, ns)
+	}
+	return ns, nil
+}
+
 // upload creates a file with the already-hashed password hash; in.Password is
-// ignored.
+// ignored. in.Namespace is "" or a namespace the caller has checked.
 func (s *Service) upload(ctx context.Context, in UploadInput, hash string) (File, error) {
 	name, err := CleanName(in.Name)
 	if err != nil {
@@ -202,10 +232,6 @@ func (s *Service) upload(ctx context.Context, in UploadInput, hash string) (File
 	ns := in.Namespace
 	if ns == "" {
 		ns = uuid.NewString()
-	} else if parsed, err := uuid.Parse(ns); err != nil {
-		return File{}, fmt.Errorf("%w: namespace must be a UUID", ErrInvalid)
-	} else {
-		ns = parsed.String()
 	}
 	emails, err := s.cleanEmails(in.AllowedEmails)
 	if err != nil {
