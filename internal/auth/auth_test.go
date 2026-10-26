@@ -163,6 +163,27 @@ func TestFullOAuthFlowWithSecretToken(t *testing.T) {
 	}
 }
 
+// The secret field must not look like a login password to the browser:
+// uploaded HTML runs on this origin, so a credential saved for the origin
+// could be autofilled into an uploaded page. Verified in Chrome: a
+// type=password field (even with autocomplete="one-time-code") still gets
+// a save offer; a masked text field does not.
+func TestAuthorizePageSecretNotSavedByBrowser(t *testing.T) {
+	_, mux, _ := newTestService(t)
+	redirect := "https://claude.ai/api/mcp/auth_callback"
+	clientID := register(t, mux, redirect)
+
+	page := do(t, mux, httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+authorizeValues(clientID, redirect).Encode(), nil))
+	body := page.Body.String()
+	want := `<input id="secret_token" name="secret_token" type="text" class="masked" required autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">`
+	if page.Code != http.StatusOK || !strings.Contains(body, want) || !strings.Contains(body, "input.masked{-webkit-text-security:disc") {
+		t.Fatalf("authorize page secret field: %d %s", page.Code, body)
+	}
+	if strings.Contains(body, `type="password"`) || strings.Contains(body, "current-password") {
+		t.Fatalf("authorize page still offers the secret as a password: %s", body)
+	}
+}
+
 func TestAuthorizeRejectsWrongSecret(t *testing.T) {
 	_, mux, _ := newTestService(t)
 	redirect := "https://claude.ai/api/mcp/auth_callback"

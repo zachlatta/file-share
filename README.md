@@ -67,7 +67,10 @@ This is the same design as the personal data warehouse:
 - **MCP clients use OAuth 2.1.** The server supports dynamic client registration and S256 PKCE.
   The authorize page asks for a client name and for the server's pre-shared `MCP_SECRET`. Client
   IDs, codes, access tokens (24 h) and refresh tokens (1 year) are HMAC-signed with the secret,
-  so auth needs no database. Rotating `MCP_SECRET` revokes everything.
+  so auth needs no database. Rotating `MCP_SECRET` revokes everything. The secret field is a
+  masked text input, not a password field, so browsers and password managers do not save it or
+  autofill it: uploaded HTML runs on this origin, and a credential saved for the origin could
+  be filled into an uploaded page.
 - **Scripts use a static bearer:** `Authorization: Bearer <client_name>:<MCP_SECRET>`. It works
   on the HTTP API and on `/mcp`, so a script can call any tool with one JSON-RPC request and
   no OAuth flow (see below).
@@ -83,8 +86,10 @@ This is the same design as the personal data warehouse:
 - **The admin dashboard** (`/admin`) takes `ADMIN_TOKEN`, which is separate from `MCP_SECRET`
   and only reads the audit log. The page keeps the token in memory and sends it as a bearer
   header to `/api/admin/*`; it never sets a cookie or uses web storage, because uploaded HTML
-  runs on this origin. `Cross-Origin-Opener-Policy: same-origin` and `frame-ancestors 'none'`
-  stop an uploaded page from opening or framing the dashboard. Reloading signs you out.
+  runs on this origin. Its token field is masked text, not a password field, for the same
+  reason, so the browser does not save the token either. `Cross-Origin-Opener-Policy:
+  same-origin` and `frame-ancestors 'none'` stop an uploaded page from opening or framing
+  the dashboard. Reloading signs you out.
 
 ## HTTP API
 

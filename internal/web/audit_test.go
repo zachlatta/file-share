@@ -204,8 +204,21 @@ func TestAdminPage(t *testing.T) {
 	e.do(visitor(http.MethodGet, urlPath(f), ""))
 	rec := e.do(httptest.NewRequest(http.MethodGet, "/admin", nil))
 	body := rec.Body.String()
-	if rec.Code != 200 || !strings.Contains(body, `type="password"`) || strings.Contains(body, "secret.txt") || strings.Contains(body, "203.0.113") {
+	if rec.Code != 200 || strings.Contains(body, "secret.txt") || strings.Contains(body, "203.0.113") {
 		t.Fatalf("admin page: %d %s", rec.Code, body)
+	}
+	// The token field must not look like a login password to the browser:
+	// a credential saved for this origin could be autofilled into an
+	// uploaded page. Verified in Chrome: a masked text field gets no save
+	// offer; type=password (even autocomplete="one-time-code") still does.
+	want := `<input id="token" name="token" type="text" class="masked" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus>`
+	if !strings.Contains(body, want) || strings.Contains(body, `type="password"`) || strings.Contains(body, "current-password") ||
+		strings.Contains(body, `name="username"`) || strings.Contains(body, `autocomplete="on"`) {
+		t.Fatalf("admin token field: %s", body)
+	}
+	css := e.do(httptest.NewRequest(http.MethodGet, "/admin/app.css", nil))
+	if css.Code != 200 || !strings.Contains(css.Body.String(), "-webkit-text-security:disc") {
+		t.Fatalf("admin css masking: %d %s", css.Code, css.Body)
 	}
 	h := rec.Header()
 	if h.Get("Cross-Origin-Opener-Policy") != "same-origin" || !strings.Contains(h.Get("Content-Security-Policy"), "frame-ancestors 'none'") ||

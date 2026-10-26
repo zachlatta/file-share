@@ -12,10 +12,9 @@
 <main id="login-view">
   <h1>file-share admin</h1>
   <p class="hint">Sign in with the admin token to see who opened protected files and what was listened to.</p>
-  <form id="login-form" autocomplete="on">
-    <input type="text" name="username" value="admin" autocomplete="username" hidden>
+  <form id="login-form">
     <label for="token">Admin token</label>
-    <input id="token" name="token" type="password" autocomplete="current-password" required autofocus>
+    <input id="token" name="token" type="text" class="masked" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus>
     <button type="submit">Sign in</button>
     <p id="login-error" class="error" hidden></p>
   </form>

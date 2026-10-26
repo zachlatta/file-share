@@ -646,13 +646,13 @@ func oauthError(w http.ResponseWriter, status int, code, description string) {
 
 var authorizeTemplate = template.Must(template.New("authorize").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize file-share</title>
-<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:34rem;margin:12vh auto;padding:0 1rem;color:#172026}input{display:block;width:100%;box-sizing:border-box;margin:.4rem 0 1rem;padding:.7rem;font:inherit;border:1px solid #b8c1cc;border-radius:6px}button{padding:.7rem 1rem;font:inherit;border:0;border-radius:6px;background:#172026;color:#fff;cursor:pointer}.error{color:#a00}.hint{font-size:.9rem;color:#5a6b78}</style></head>
+<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:34rem;margin:12vh auto;padding:0 1rem;color:#172026}input{display:block;width:100%;box-sizing:border-box;margin:.4rem 0 1rem;padding:.7rem;font:inherit;border:1px solid #b8c1cc;border-radius:6px}input.masked{-webkit-text-security:disc;text-security:disc}button{padding:.7rem 1rem;font:inherit;border:0;border-radius:6px;background:#172026;color:#fff;cursor:pointer}.error{color:#a00}.hint{font-size:.9rem;color:#5a6b78}</style></head>
 <body><h1>Authorize file-share</h1>
 <p>This gives the connecting app full control of your files: upload, replace, delete, restore and set passwords.</p>
 {{with .Error}}<p class="error">{{.}}</p>{{end}}
 <form method="post" action="/oauth/authorize">
 {{range $key, $values := .Fields}}{{if and (ne $key "client_name") (ne $key "secret_token")}}{{range $values}}<input type="hidden" name="{{$key}}" value="{{.}}">{{end}}{{end}}{{end}}
 <label for="client_name">Client name</label><input id="client_name" name="client_name" type="text" autocomplete="off" autofocus required maxlength="64" placeholder="e.g. claude, codex">
-<label for="secret_token">Secret token</label><input id="secret_token" name="secret_token" type="password" required autocomplete="current-password">
+<label for="secret_token">Secret token</label><input id="secret_token" name="secret_token" type="text" class="masked" required autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
 <p class="hint">The client name is logged with every request so you can tell connectors apart.</p>
 <button type="submit">Authorize</button></form></body></html>`))
