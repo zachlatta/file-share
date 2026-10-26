@@ -16,7 +16,7 @@ services:
       interval: 2s
       retries: 30
   garage:
-    image: dxflrs/garage:v2.1.0
+    image: dxflrs/garage:v2.3.0
     ports: ["127.0.0.1:3900:3900"]
     volumes:
       - ./dev/garage.toml:/etc/garage.toml:ro
