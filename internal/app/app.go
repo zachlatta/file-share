@@ -92,8 +92,9 @@ func (a *App) RunPurge(ctx context.Context) {
 		res, err := a.files.Purge(ctx)
 		if err != nil {
 			a.logger.Error("purge failed", "error", err)
-		} else if res.Files+res.Versions > 0 {
-			a.logger.Info("purged expired files", "files", res.Files, "versions", res.Versions, "blobs", res.Blobs)
+		} else if res.Files+res.Versions+res.Orphans+res.Parts > 0 {
+			a.logger.Info("purged expired files", "files", res.Files, "versions", res.Versions, "blobs", res.Blobs,
+				"orphans", res.Orphans, "parts", res.Parts)
 		}
 		select {
 		case <-ctx.Done():

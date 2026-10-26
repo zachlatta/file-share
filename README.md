@@ -147,8 +147,10 @@ instead of this API, so they never need the secret.
   startup.
 - **S3-compatible object storage** holds bytes. Every version is written once under a random
   key and never modified. Rollback reuses the old version's object. A purge deletes an object
-  only when no remaining version references it. Object-store versioning is not needed, so this
-  works on Garage, MinIO, R2 or S3. Addressing is path-style.
+  only when no remaining version references it. If that delete fails (storage down), or a
+  failed upload leaves its object behind, the hourly purge lists `blobs/` and deletes any
+  object that is over 24 hours old and that no version references. Object-store versioning
+  is not needed, so this works on Garage, MinIO, R2 or S3. Addressing is path-style.
 
 ## Configuration
 

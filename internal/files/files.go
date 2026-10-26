@@ -574,6 +574,9 @@ type PurgeResult struct {
 	Parts int `json:"parts"`
 	// Links counts expired upload links removed.
 	Links int `json:"links"`
+	// Orphans counts objects under blobs/ that no version referenced, such
+	// as bytes left when a purge's delete failed.
+	Orphans int `json:"orphans"`
 }
 
 // Purge permanently removes deleted files and replaced versions that are
@@ -607,12 +610,14 @@ func (s *Service) Purge(ctx context.Context) (PurgeResult, error) {
 		return err
 	})
 	if err != nil {
+		// The sweeps below need the database too; the next purge retries.
 		return PurgeResult{}, err
 	}
-	var blobErr, partErr error
+	var blobErr, partErr, orphanErr error
 	res.Blobs, blobErr = s.deleteOrphanBlobs(ctx, keys)
 	res.Parts, partErr = s.purgeParts(ctx)
-	return res, errors.Join(blobErr, partErr)
+	res.Orphans, orphanErr = s.purgeOrphans(ctx)
+	return res, errors.Join(blobErr, partErr, orphanErr)
 }
 
 func (s *Service) blobKeys(ctx context.Context, query string, args ...any) ([]string, error) {
@@ -647,6 +652,50 @@ func (s *Service) deleteOrphanBlobs(ctx context.Context, keys []string) (int, er
 			continue
 		}
 		deleted++
+	}
+	return deleted, errors.Join(errs...)
+}
+
+// orphanGrace protects a blob between storeBlob's Put and the INSERT of the
+// versions row that references it. An object is listed only once its Put has
+// finished, so an upload would have to stall for this long to be at risk.
+const orphanGrace = 24 * time.Hour
+
+// purgeOrphans deletes objects under blobs/ that are older than orphanGrace
+// and that no version references: bytes left when a purge's delete failed, or
+// when an upload failed and its cleanup delete failed too. Nothing can start
+// referencing an unreferenced key, because uploads always write a new key and
+// a rollback only reuses a key a version already holds.
+func (s *Service) purgeOrphans(ctx context.Context) (int, error) {
+	objects, err := s.blobs.List(ctx, "blobs/")
+	if err != nil {
+		return 0, err
+	}
+	cutoff := s.now().Add(-orphanGrace)
+	var old []string
+	for _, obj := range objects {
+		if obj.Modified.Before(cutoff) {
+			old = append(old, obj.Key)
+		}
+	}
+	deleted := 0
+	var errs []error
+	for batch := range slices.Chunk(old, 1000) {
+		used, err := s.blobKeys(ctx, `SELECT blob_key FROM versions WHERE blob_key = ANY($1)`, batch)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, key := range batch {
+			if slices.Contains(used, key) {
+				continue
+			}
+			if err := s.blobs.Delete(ctx, key); err != nil {
+				errs = append(errs, fmt.Errorf("delete orphan blob %s: %w", key, err))
+				continue
+			}
+			deleted++
+		}
 	}
 	return deleted, errors.Join(errs...)
 }

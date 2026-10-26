@@ -6,6 +6,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,7 +24,22 @@ func (c *clock) now() time.Time { return c.t }
 type harness struct {
 	svc   *Service
 	blobs *blob.Memory
+	flaky *flakyBlobs
 	clock *clock
+}
+
+// flakyBlobs fails every Delete while failDeletes is set, as when the object
+// store is down.
+type flakyBlobs struct {
+	*blob.Memory
+	failDeletes atomic.Bool
+}
+
+func (f *flakyBlobs) Delete(ctx context.Context, key string) error {
+	if f.failDeletes.Load() {
+		return errors.New("object store unavailable")
+	}
+	return f.Memory.Delete(ctx, key)
 }
 
 func newHarness(t *testing.T) *harness {
@@ -32,9 +48,10 @@ func newHarness(t *testing.T) *harness {
 	c := &clock{t: time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)}
 	blobs := blob.NewMemory()
 	blobs.Now = c.now
+	flaky := &flakyBlobs{Memory: blobs}
 	svc, err := Open(ctx, Config{
 		DatabaseURL: pgtest.New(t),
-		Blobs:       blobs,
+		Blobs:       flaky,
 		BaseURL:     "https://files.example.com",
 		Retention:   30 * 24 * time.Hour,
 		MaxBytes:    1 << 20,
@@ -45,7 +62,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	t.Cleanup(svc.Close)
-	return &harness{svc: svc, blobs: blobs, clock: c}
+	return &harness{svc: svc, blobs: blobs, flaky: flaky, clock: c}
 }
 
 func (h *harness) upload(t *testing.T, ns, name, body string) File {
@@ -474,6 +491,98 @@ func TestPurgeRemovesAbandonedParts(t *testing.T) {
 	res, err := h.svc.Purge(ctx)
 	if err != nil || res.Parts != 1 || len(h.blobs.Keys()) != 0 {
 		t.Fatalf("stale part not purged: %+v %v %v", res, err, h.blobs.Keys())
+	}
+}
+
+// A purge_file whose blob deletes fail (storage down) has already removed the
+// versions rows, so nothing references the bytes any more. The hourly purge
+// finds them by listing the store and removes them once the grace period has
+// passed.
+func TestPurgeSweepsBlobsLeftByFailedPurgeFile(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	f := h.upload(t, "", "leak.txt", "secret v1")
+	if _, err := h.svc.Replace(ctx, f.ID, ReplaceInput{Body: strings.NewReader("secret v2"), Size: -1}); err != nil {
+		t.Fatal(err)
+	}
+	h.flaky.failDeletes.Store(true)
+	if err := h.svc.PurgeFile(ctx, f.ID); err == nil {
+		t.Fatal("purge with storage down reported success")
+	}
+	if n := len(h.blobs.Keys()); n != 2 {
+		t.Fatalf("blobs after failed delete = %d, want 2", n)
+	}
+	if err := h.svc.PurgeFile(ctx, f.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second purge_file: %v", err)
+	}
+	h.flaky.failDeletes.Store(false)
+
+	res, err := h.svc.Purge(ctx)
+	if err != nil || res.Orphans != 0 || len(h.blobs.Keys()) != 2 {
+		t.Fatalf("orphans swept inside the grace period: %+v %v %v", res, err, h.blobs.Keys())
+	}
+	h.clock.t = h.clock.t.Add(25 * time.Hour)
+	res, err = h.svc.Purge(ctx)
+	if err != nil || res.Orphans != 2 || len(h.blobs.Keys()) != 0 {
+		t.Fatalf("orphans not swept: %+v %v %v", res, err, h.blobs.Keys())
+	}
+}
+
+// An upload has run Put but not yet inserted its versions row: its blob is
+// unreferenced but must survive until the grace period passes. Keys outside
+// blobs/ are never touched by the sweep.
+func TestPurgeKeepsFreshOrphans(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	stray := "blobs/" + uuid.NewString()
+	for _, key := range []string{stray, "other/keep"} {
+		if err := h.blobs.Put(ctx, key, strings.NewReader("x"), 1, "text/plain"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.clock.t = h.clock.t.Add(23 * time.Hour)
+	res, err := h.svc.Purge(ctx)
+	if err != nil || res.Orphans != 0 || len(h.blobs.Keys()) != 2 {
+		t.Fatalf("fresh orphan swept: %+v %v %v", res, err, h.blobs.Keys())
+	}
+	h.clock.t = h.clock.t.Add(2 * time.Hour)
+	res, err = h.svc.Purge(ctx)
+	if err != nil || res.Orphans != 1 || !slices.Equal(h.blobs.Keys(), []string{"other/keep"}) {
+		t.Fatalf("stale orphan not swept: %+v %v %v", res, err, h.blobs.Keys())
+	}
+}
+
+// Blobs referenced by a live version, a replaced version still inside
+// retention, or a rollback that shares an older version's blob are kept.
+func TestPurgeKeepsReferencedBlobs(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	live := h.upload(t, "", "live.txt", "a1")
+	replaced := h.upload(t, "", "replaced.txt", "b1")
+	if _, err := h.svc.Replace(ctx, replaced.ID, ReplaceInput{Body: strings.NewReader("b2"), Size: -1}); err != nil {
+		t.Fatal(err)
+	}
+	rolled := h.upload(t, "", "rolled.txt", "c1")
+	if _, err := h.svc.Replace(ctx, rolled.ID, ReplaceInput{Body: strings.NewReader("c2"), Size: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.Rollback(ctx, rolled.ID, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	before := len(h.blobs.Keys())
+	h.clock.t = h.clock.t.Add(25 * time.Hour)
+	res, err := h.svc.Purge(ctx)
+	if err != nil || res.Orphans != 0 || len(h.blobs.Keys()) != before {
+		t.Fatalf("referenced blobs swept: %+v %v %d -> %d", res, err, before, len(h.blobs.Keys()))
+	}
+	if h.read(t, live, 0) != "a1" || h.read(t, replaced, 1) != "b1" || h.read(t, rolled, 0) != "c1" {
+		t.Fatal("referenced content damaged by the sweep")
+	}
+
+	// After retention, the rollback's shared blob is still referenced by v3.
+	h.clock.t = h.clock.t.Add(31 * 24 * time.Hour)
+	if res, err = h.svc.Purge(ctx); err != nil || res.Orphans != 0 || h.read(t, rolled, 0) != "c1" {
+		t.Fatalf("purge after retention: %+v %v", res, err)
 	}
 }
 
