@@ -41,12 +41,15 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
   base64s big files through a chat message. The link fixes the name (optional: omit it to use
   the uploaded file's name), namespace, password and allowed emails; the upload only sends the
   bytes. It works once: a second upload returns `410 Gone`. A failed upload releases it for a
-  retry, and an unused link expires (default 60 minutes, max 24 hours). Cloudflare rejects
-  request bodies over 100 MB, so bigger files go up in parts: `PUT <url>?part=1..N` (each part
-  90 MB or less), then `POST <url>?complete=N` (plus `&name=` if the link has no name). The tool
-  returns a ready-made `curl_chunked` script. Pass `local_path` and both commands name your file,
-  so they run as is; without it they use a `./LOCAL_FILE` placeholder. Unfinished parts are
-  deleted after 24 hours.
+  retry, and an unused link expires (default 60 minutes, max 24 hours). Proxies cap request
+  bodies (Cloudflare rejects bodies over 100 MB) and time out slow single-stream uploads, so
+  files over 20 MB go up in parts: `PUT <url>?part=1..N` (each part 20 MB or less), then poll
+  `POST <url>?complete=N` (plus `&name=` if the link has no name), which assembles the parts in
+  the background and returns `202 Accepted` (`{"status":"assembling"}`) if still running after
+  60 seconds, then `201 Created` (or `200 OK` when replacing) with the file JSON once done. The
+  tool returns a ready-made `curl_chunked` script with retries and completion polling. Pass
+  `local_path` and both commands name your file, so they run as is; without it they use a
+  `./LOCAL_FILE` placeholder. Unfinished parts are deleted after 24 hours.
   `create_download_url` does the same for downloads, including old versions, password-protected
   files and deleted files.
 
@@ -119,8 +122,9 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' -H 'Accept: application/
   | jq .result.structuredContent
 ```
 
-The same 100 MB per-request ceiling applies to `/api/files` through the public hostname. Use a
-signed upload URL for anything larger. Agents connected over MCP should use `create_upload_url`
+`/api/files` is a single-request upload endpoint (capped at 100 MB through Cloudflare and bound
+by the origin proxy's request read timeout). Use a signed upload URL (`create_upload_url`) with
+`curl_chunked` for anything over 20 MB. Agents connected over MCP should use `create_upload_url`
 instead of this API, so they never need the secret.
 
 ## Serving

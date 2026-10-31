@@ -176,6 +176,20 @@ func TestUploadNamespaceMustExist(t *testing.T) {
 	if f := h.upload(t, b.Namespace, "again.txt", "x"); f.Namespace != b.Namespace {
 		t.Fatalf("namespace of a deleted file: %+v", f)
 	}
+
+	// A namespace created by CreateUploadLink is accepted before the first
+	// link completes, so multi-file sets can create links in one namespace.
+	link, err := h.svc.CreateUploadLink(ctx, UploadLinkInput{Name: "part-01.zip", ExpiresAt: h.clock.t.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	link2, err := h.svc.CreateUploadLink(ctx, UploadLinkInput{Namespace: link.Namespace, Name: "part-02.zip", ExpiresAt: h.clock.t.Add(time.Hour)})
+	if err != nil || link2.Namespace != link.Namespace {
+		t.Fatalf("second upload link in pending namespace: %+v %v", link2, err)
+	}
+	if f := h.upload(t, link.URL, "manifest.json", "{}"); f.Namespace != link.Namespace {
+		t.Fatalf("upload into pending link namespace by URL: %+v", f)
+	}
 }
 
 func TestNameValidation(t *testing.T) {
@@ -502,11 +516,14 @@ func TestChunkedUploads(t *testing.T) {
 		t.Fatalf("bad key: %v", err)
 	}
 	// Completing with a missing part fails and keeps the parts.
-	_, err := h.svc.CompleteParts(ctx, key, 4, func(r io.Reader) (File, error) { t.Fatal("assembled with a missing part"); return File{}, nil })
+	_, err := h.svc.CompleteParts(ctx, key, 4, func(context.Context, io.Reader) (File, error) {
+		t.Fatal("assembled with a missing part")
+		return File{}, nil
+	})
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("missing part: %v", err)
 	}
-	f, err := h.svc.CompleteParts(ctx, key, 3, func(r io.Reader) (File, error) {
+	f, err := h.svc.CompleteParts(ctx, key, 3, func(ctx context.Context, r io.Reader) (File, error) {
 		return h.svc.Upload(ctx, UploadInput{Name: "joined.txt", Body: r, Size: -1})
 	})
 	if err != nil {

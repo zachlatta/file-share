@@ -11,16 +11,41 @@ import (
 	"github.com/zachlatta/file-share/internal/blob"
 )
 
-// Chunked uploads exist because proxies in front of the server (Cloudflare
-// caps request bodies at 100 MB) cannot carry one large body. Each part is
-// stored as a temporary object; completing streams the parts, in order,
-// through the normal upload path and then deletes them. Parts that are never
-// completed are purged after partTTL.
+// Chunked uploads exist because proxies in front of the server cap request
+// bodies (Cloudflare rejects bodies over 100 MB) and time out slow
+// single-stream uploads or long-running completions. Each part is stored as a
+// temporary object; completing streams the parts in a detached background job
+// through the normal upload path (returning ErrAssembling if a request wait
+// window elapses first so callers can poll) and then deletes them. Parts that
+// are never completed are purged after partTTL.
 
 const (
 	maxParts = 10000
 	partTTL  = 24 * time.Hour
 )
+
+type completion struct {
+	done   chan struct{}
+	file   File
+	err    error
+	doneAt time.Time
+}
+
+func (s *Service) sweepCompletingLocked(now time.Time) {
+	for k, c := range s.completing {
+		if !c.doneAt.IsZero() && now.Sub(c.doneAt) >= s.completeResultTTL {
+			delete(s.completing, k)
+		}
+	}
+}
+
+func (s *Service) hasCompleting(uploadKey string) bool {
+	s.completingMu.Lock()
+	defer s.completingMu.Unlock()
+	s.sweepCompletingLocked(s.now())
+	_, ok := s.completing[uploadKey]
+	return ok
+}
 
 var uploadKeyPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
@@ -50,36 +75,91 @@ func (s *Service) PutPart(ctx context.Context, uploadKey string, n int, body io.
 }
 
 // CompleteParts opens parts 1..parts of uploadKey as one stream and passes it
-// to fn (normally Upload or Replace). The parts are deleted only if fn
-// succeeds, so a failed completion can be retried.
-func (s *Service) CompleteParts(ctx context.Context, uploadKey string, parts int, fn func(io.Reader) (File, error)) (File, error) {
+// to fn (normally Upload, Replace or UploadWithLink) in a detached background
+// context. If assembly takes longer than CompleteWait, CompleteParts returns
+// ErrAssembling while the background job continues; subsequent calls for the
+// same uploadKey wait on the running job or return its finished result. The
+// parts are deleted only if fn succeeds, so a failed completion can be retried.
+func (s *Service) CompleteParts(ctx context.Context, uploadKey string, parts int, fn func(context.Context, io.Reader) (File, error)) (File, error) {
 	if !uploadKeyPattern.MatchString(uploadKey) {
 		return File{}, fmt.Errorf("%w: bad upload key", ErrInvalid)
 	}
 	if parts < 1 || parts > maxParts {
 		return File{}, fmt.Errorf("%w: parts must be between 1 and %d", ErrInvalid, maxParts)
 	}
-	existing, err := s.blobs.List(ctx, "uploads/"+uploadKey+"/")
-	if err != nil {
-		return File{}, err
+	s.completingMu.Lock()
+	s.sweepCompletingLocked(s.now())
+	job, exists := s.completing[uploadKey]
+	if !exists {
+		job = &completion{done: make(chan struct{})}
+		s.completing[uploadKey] = job
+		s.completingWG.Add(1)
 	}
-	have := map[string]bool{}
-	for _, obj := range existing {
-		have[obj.Key] = true
+	s.completingMu.Unlock()
+
+	if !exists {
+		go s.runCompletion(ctx, uploadKey, parts, fn, job)
 	}
-	for n := 1; n <= parts; n++ {
-		if !have[partKey(uploadKey, n)] {
-			return File{}, fmt.Errorf("%w: part %d has not been uploaded", ErrInvalid, n)
+
+	select {
+	case <-job.done:
+		return job.file, job.err
+	default:
+	}
+	timer := time.NewTimer(s.completeWait)
+	defer timer.Stop()
+	select {
+	case <-job.done:
+		return job.file, job.err
+	case <-timer.C:
+		return File{}, ErrAssembling
+	case <-ctx.Done():
+		return File{}, ctx.Err()
+	}
+}
+
+func (s *Service) runCompletion(reqCtx context.Context, uploadKey string, parts int, fn func(context.Context, io.Reader) (File, error), job *completion) {
+	defer s.completingWG.Done()
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), s.completeTimeout)
+	stop := context.AfterFunc(s.closeCtx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	existing, err := s.blobs.List(bgCtx, "uploads/"+uploadKey+"/")
+	if err == nil {
+		have := map[string]bool{}
+		for _, obj := range existing {
+			have[obj.Key] = true
+		}
+		for n := 1; n <= parts; n++ {
+			if !have[partKey(uploadKey, n)] {
+				err = fmt.Errorf("%w: part %d has not been uploaded", ErrInvalid, n)
+				break
+			}
 		}
 	}
-	f, err := fn(&partReader{ctx: ctx, blobs: s.blobs, uploadKey: uploadKey, parts: parts})
 	if err != nil {
-		return File{}, err
+		s.completingMu.Lock()
+		job.err = err
+		delete(s.completing, uploadKey)
+		close(job.done)
+		s.completingMu.Unlock()
+		return
 	}
-	for _, obj := range existing {
-		_ = s.blobs.Delete(ctx, obj.Key)
+
+	f, err := fn(bgCtx, &partReader{ctx: bgCtx, blobs: s.blobs, uploadKey: uploadKey, parts: parts})
+	if err == nil {
+		for _, obj := range existing {
+			_ = s.blobs.Delete(bgCtx, obj.Key)
+		}
 	}
-	return f, nil
+	s.completingMu.Lock()
+	job.file, job.err = f, err
+	job.doneAt = s.now()
+	close(job.done)
+	s.completingMu.Unlock()
 }
 
 // partReader reads the parts one after another, opening each lazily.

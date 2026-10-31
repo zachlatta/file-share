@@ -146,20 +146,66 @@ func (s *Service) UploadLink(ctx context.Context, id string) (UploadLink, error)
 	return link, nil
 }
 
+// UploadLinkForComplete checks a link for a chunked ?complete=N request. If
+// the link has already completed, it returns the resulting File; if assembly
+// is in flight on this instance, or the link is unused, or a previous claim
+// has gone stale past completeTimeout, it returns a nil *File so the caller
+// can run or wait on CompleteParts.
+func (s *Service) UploadLinkForComplete(ctx context.Context, id, uploadKey string) (UploadLink, *File, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return UploadLink{}, nil, fmt.Errorf("%w: upload link", ErrNotFound)
+	}
+	var link UploadLink
+	var used *time.Time
+	var resultFileID string
+	err := s.db.QueryRow(ctx, `SELECT id::text, COALESCE(namespace::text, ''), name, COALESCE(file_id::text, ''), expires_at, used_at, COALESCE(result_file_id::text, '')
+		FROM upload_links WHERE id = $1`, id).Scan(&link.ID, &link.Namespace, &link.Name, &link.FileID, &link.ExpiresAt, &used, &resultFileID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return UploadLink{}, nil, fmt.Errorf("%w: upload link", ErrNotFound)
+	}
+	if err != nil {
+		return UploadLink{}, nil, err
+	}
+	if link.Name != "" {
+		link.URL = s.URLFor(link.Namespace, link.Name)
+	}
+	if s.hasCompleting(uploadKey) {
+		return link, nil, nil
+	}
+	if resultFileID != "" {
+		f, err := s.Get(ctx, resultFileID)
+		if err != nil {
+			return UploadLink{}, nil, err
+		}
+		return link, &f, nil
+	}
+	now := s.nowUTC()
+	if used != nil && used.After(now.Add(-s.completeTimeout)) {
+		return UploadLink{}, nil, ErrLinkUsed
+	}
+	if !link.ExpiresAt.After(now) {
+		return UploadLink{}, nil, fmt.Errorf("%w: upload link expired", ErrNotFound)
+	}
+	return link, nil, nil
+}
+
 // UploadWithLink uses link id once. The link is claimed before the upload so
 // two concurrent requests cannot both succeed, and released again if the
-// upload fails so the caller can retry.
+// upload fails so the caller can retry. A claim whose assembly never
+// finished can be re-claimed only after completeTimeout has elapsed.
 func (s *Service) UploadWithLink(ctx context.Context, id string, in LinkUpload) (File, error) {
 	if _, err := uuid.Parse(id); err != nil {
 		return File{}, fmt.Errorf("%w: upload link", ErrNotFound)
 	}
+	now := s.nowUTC()
+	staleCutoff := now.Add(-s.completeTimeout)
 	var ns, name, fileID, hash, client string
 	var emails []string
 	var expected int
 	err := s.db.QueryRow(ctx, `UPDATE upload_links SET used_at = $2
-		WHERE id = $1 AND used_at IS NULL AND expires_at > $2
+		WHERE id = $1 AND result_file_id IS NULL AND (used_at IS NULL OR used_at <= $3) AND expires_at > $2
 		RETURNING COALESCE(namespace::text, ''), name, COALESCE(file_id::text, ''), COALESCE(password_hash, ''), allowed_emails, client, expected_version`,
-		id, s.nowUTC()).Scan(&ns, &name, &fileID, &hash, &emails, &client, &expected)
+		id, now, staleCutoff).Scan(&ns, &name, &fileID, &hash, &emails, &client, &expected)
 	if errors.Is(err, pgx.ErrNoRows) {
 		_, err = s.UploadLink(ctx, id)
 		if err == nil {
@@ -183,9 +229,12 @@ func (s *Service) UploadWithLink(ctx context.Context, id string, in LinkUpload) 
 		f, err = s.upload(ctx, UploadInput{Namespace: ns, Name: name, ContentType: in.ContentType, Body: in.Body, Size: in.Size, AllowedEmails: emails, Client: client}, hash)
 	}
 	if err != nil {
-		if _, releaseErr := s.db.Exec(context.WithoutCancel(ctx), `UPDATE upload_links SET used_at = NULL WHERE id = $1`, id); releaseErr != nil {
+		if _, releaseErr := s.db.Exec(context.WithoutCancel(ctx), `UPDATE upload_links SET used_at = NULL WHERE id = $1 AND result_file_id IS NULL`, id); releaseErr != nil {
 			err = errors.Join(err, releaseErr)
 		}
+		return File{}, err
+	}
+	if _, err := s.db.Exec(context.WithoutCancel(ctx), `UPDATE upload_links SET result_file_id = $2 WHERE id = $1`, id, f.ID); err != nil {
 		return File{}, err
 	}
 	return f, nil

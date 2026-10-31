@@ -379,6 +379,9 @@ func (h *Handler) readUpload(r *http.Request, fn func(upload) (files.File, error
 			break
 		}
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
+				return files.File{}, context.Canceled
+			}
 			return files.File{}, fmt.Errorf("%w: %v", files.ErrInvalid, err)
 		}
 		if part.FormName() == "file" {
@@ -395,6 +398,9 @@ func (h *Handler) readUpload(r *http.Request, fn func(upload) (files.File, error
 			}
 			n, err := io.Copy(spool, src)
 			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
+					return files.File{}, context.Canceled
+				}
 				return files.File{}, fmt.Errorf("%w: reading upload: %v", files.ErrInvalid, err)
 			}
 			if limit > 0 && n > limit {
@@ -608,6 +614,40 @@ func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or expired upload link", http.StatusUnauthorized)
 		return
 	}
+	q := r.URL.Query()
+	// Chunked mode, for bodies larger than a proxy allows in one request:
+	// PUT ?part=1..N, then POST ?complete=N.
+	sum := sha256.Sum256([]byte(linkID))
+	uploadKey := hex.EncodeToString(sum[:16])
+	if q.Has("complete") {
+		parts, err := strconv.Atoi(q.Get("complete"))
+		if err != nil {
+			respond(w, 0, nil, fmt.Errorf("%w: complete must be the number of parts", files.ErrInvalid))
+			return
+		}
+		link, done, err := h.files.UploadLinkForComplete(r.Context(), linkID, uploadKey)
+		if err != nil {
+			respond(w, 0, nil, err)
+			return
+		}
+		status := http.StatusCreated
+		if link.FileID != "" {
+			status = http.StatusOK
+		}
+		if done != nil {
+			respond(w, status, *done, nil)
+			return
+		}
+		f, err := h.files.CompleteParts(r.Context(), uploadKey, parts, func(ctx context.Context, body io.Reader) (files.File, error) {
+			return h.files.UploadWithLink(ctx, linkID, files.LinkUpload{Name: q.Get("name"), Body: body, Size: -1})
+		})
+		if errors.Is(err, files.ErrAssembling) {
+			writeJSON(w, http.StatusAccepted, map[string]string{"status": "assembling"})
+			return
+		}
+		respond(w, status, f, err)
+		return
+	}
 	link, err := h.files.UploadLink(r.Context(), linkID)
 	if err != nil {
 		respond(w, 0, nil, err)
@@ -617,11 +657,6 @@ func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
 	if link.FileID != "" {
 		status = http.StatusOK
 	}
-	q := r.URL.Query()
-	// Chunked mode, for bodies larger than a proxy allows in one request:
-	// PUT ?part=1..N, then POST ?complete=N.
-	sum := sha256.Sum256([]byte(linkID))
-	uploadKey := hex.EncodeToString(sum[:16])
 	if q.Has("part") {
 		n, err := strconv.Atoi(q.Get("part"))
 		if err != nil {
@@ -634,18 +669,6 @@ func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		written, err := h.files.PutPart(r.Context(), uploadKey, n, r.Body, size)
 		respond(w, http.StatusOK, map[string]any{"part": n, "size": written}, err)
-		return
-	}
-	if q.Has("complete") {
-		parts, err := strconv.Atoi(q.Get("complete"))
-		if err != nil {
-			respond(w, 0, nil, fmt.Errorf("%w: complete must be the number of parts", files.ErrInvalid))
-			return
-		}
-		f, err := h.files.CompleteParts(r.Context(), uploadKey, parts, func(body io.Reader) (files.File, error) {
-			return h.files.UploadWithLink(r.Context(), linkID, files.LinkUpload{Name: q.Get("name"), Body: body, Size: -1})
-		})
-		respond(w, status, f, err)
 		return
 	}
 	f, err := h.readUpload(r, func(u upload) (files.File, error) {
@@ -665,6 +688,10 @@ func respond(w http.ResponseWriter, status int, v any, err error) {
 	writeJSON(w, status, v)
 }
 
+// StatusClientClosedRequest is the HTTP 499 status used by reverse proxies
+// when a client disconnects before the request completes.
+const StatusClientClosedRequest = 499
+
 // StatusFor maps domain errors to HTTP statuses.
 func StatusFor(err error) int {
 	var maxBytes *http.MaxBytesError
@@ -679,6 +706,8 @@ func StatusFor(err error) int {
 		return http.StatusBadRequest
 	case errors.Is(err, files.ErrLinkUsed):
 		return http.StatusGone
+	case errors.Is(err, context.Canceled):
+		return StatusClientClosedRequest
 	default:
 		return http.StatusInternalServerError
 	}

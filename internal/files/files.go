@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,12 +31,13 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrExists   = errors.New("a live file with that name already exists in the namespace")
-	ErrInvalid  = errors.New("invalid input")
-	ErrTooLarge = errors.New("file is larger than the upload limit")
-	ErrLinkUsed = errors.New("this upload link has already been used; create a new one")
-	ErrConflict = errors.New("the file changed since you read it")
+	ErrNotFound   = errors.New("not found")
+	ErrExists     = errors.New("a live file with that name already exists in the namespace")
+	ErrInvalid    = errors.New("invalid input")
+	ErrTooLarge   = errors.New("file is larger than the upload limit")
+	ErrLinkUsed   = errors.New("this upload link has already been used; create a new one")
+	ErrConflict   = errors.New("the file changed since you read it")
+	ErrAssembling = errors.New("upload is still assembling")
 )
 
 type Config struct {
@@ -50,17 +52,28 @@ type Config struct {
 	// EmailLogin reports that visitors can sign in with Hack Club Auth.
 	// Without it, files cannot be restricted to email addresses.
 	EmailLogin bool
-	Now        func() time.Time
+	// CompleteWait is how long a chunked completion request waits before
+	// returning ErrAssembling while assembly continues in the background.
+	CompleteWait time.Duration
+	Now          func() time.Time
 }
 
 type Service struct {
-	db        *pgxpool.Pool
-	blobs     blob.Store
-	baseURL   string
-	retention time.Duration
-	maxBytes  int64
-	emailAuth bool
-	now       func() time.Time
+	db                *pgxpool.Pool
+	blobs             blob.Store
+	baseURL           string
+	retention         time.Duration
+	maxBytes          int64
+	emailAuth         bool
+	now               func() time.Time
+	completeWait      time.Duration
+	completeTimeout   time.Duration
+	completeResultTTL time.Duration
+	completingMu      sync.Mutex
+	completing        map[string]*completion
+	completingWG      sync.WaitGroup
+	closeCtx          context.Context
+	closeCancel       context.CancelFunc
 }
 
 // File is a file's current state. Times are UTC.
@@ -114,6 +127,9 @@ func Open(ctx context.Context, cfg Config) (*Service, error) {
 	if cfg.Retention <= 0 {
 		cfg.Retention = 30 * 24 * time.Hour
 	}
+	if cfg.CompleteWait <= 0 {
+		cfg.CompleteWait = 60 * time.Second
+	}
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
@@ -122,13 +138,20 @@ func Open(ctx context.Context, cfg Config) (*Service, error) {
 		pool.Close()
 		return nil, err
 	}
+	closeCtx, closeCancel := context.WithCancel(context.Background())
 	return &Service{
 		db: pool, blobs: cfg.Blobs, baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 		retention: cfg.Retention, maxBytes: cfg.MaxBytes, emailAuth: cfg.EmailLogin, now: cfg.Now,
+		completeWait: cfg.CompleteWait, completeTimeout: 30 * time.Minute, completeResultTTL: 5 * time.Minute,
+		completing: make(map[string]*completion), closeCtx: closeCtx, closeCancel: closeCancel,
 	}, nil
 }
 
-func (s *Service) Close() { s.db.Close() }
+func (s *Service) Close() {
+	s.closeCancel()
+	s.completingWG.Wait()
+	s.db.Close()
+}
 
 func (s *Service) Retention() time.Duration { return s.retention }
 func (s *Service) MaxBytes() int64          { return s.maxBytes }
@@ -198,9 +221,10 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (File, error) {
 }
 
 // existingNamespace resolves a namespace a caller asked to upload into: its
-// UUID, its URL or any file URL in it. It must already hold a file, live or
-// deleted, so every namespace is one the server generated at random; a
-// caller-chosen UUID could be guessed. "" stays "" (a new namespace).
+// UUID, its URL or any file URL in it. It must already hold a file (live or
+// deleted) or an upload link, so every namespace is one the server generated
+// at random; a caller-chosen UUID could be guessed. "" stays "" (a new
+// namespace).
 func (s *Service) existingNamespace(ctx context.Context, ref string) (string, error) {
 	if ref == "" {
 		return "", nil
@@ -213,7 +237,7 @@ func (s *Service) existingNamespace(ctx context.Context, ref string) (string, er
 	}
 	ns := parsed.String()
 	var exists bool
-	if err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM files WHERE namespace = $1)`, ns).Scan(&exists); err != nil {
+	if err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM files WHERE namespace = $1 UNION ALL SELECT 1 FROM upload_links WHERE namespace = $1)`, ns).Scan(&exists); err != nil {
 		return "", err
 	}
 	if !exists {

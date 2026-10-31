@@ -103,6 +103,10 @@ var migrations = []string{
 	);
 	CREATE INDEX file_requests_file ON file_requests (file_id, id DESC);
 	CREATE INDEX file_requests_namespace ON file_requests (namespace, id DESC);`,
+	// Chunked upload completion runs in the background so proxy timeouts do
+	// not abort multi-gigabyte joins; result_file_id lets retries return the
+	// finished file.
+	`ALTER TABLE upload_links ADD COLUMN result_file_id uuid REFERENCES files (id) ON DELETE SET NULL;`,
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {

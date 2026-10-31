@@ -196,8 +196,8 @@ type uploadURLOutput struct {
 	URL       string `json:"url,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
 	Curl      string `json:"curl"`
-	// The public proxy rejects request bodies over 100 MB, so larger files
-	// must be sent in parts.
+	// Proxies cap request bodies and time out slow single-stream uploads,
+	// so files over 20 MB should be sent in parts.
 	MaxSingleRequestMB int    `json:"max_single_request_mb"`
 	CurlChunked        string `json:"curl_chunked"`
 }
@@ -235,7 +235,7 @@ func New(cfg Config) *mcp.Server {
 	destructive := &mcp.ToolAnnotations{DestructiveHint: ptr(true), OpenWorldHint: &closed}
 
 	add(srv, "upload_file", "Upload a new file and get its public URL. Give exactly one of content_text, content_base64 or source_url. Omit namespace for a fresh unguessable URL; pass a namespace to group files. Optionally restrict it to allowed_emails (sign in with Hack Club) or a password.", fetching, s.upload)
-	add(srv, "create_upload_url", "Get a single-use URL that accepts one file over HTTP, so a local or large file can be uploaded with curl and no secret. Set name, namespace, password and allowed_emails here; the upload only sends the bytes. Files up to 95 MB: run the returned curl (multipart; omit name to use the local file's name). Larger files: run curl_chunked, which PUTs 90 MB parts with ?part=N and then POSTs ?complete=N. Pass local_path to get commands that run as is. The URL stops working after one successful upload. Pass file to upload a new version of an existing file instead.", additive, s.uploadURL)
+	add(srv, "create_upload_url", "Get a single-use URL that accepts one file over HTTP, so a local or large file can be uploaded with curl and no secret. Set name, namespace, password and allowed_emails here; the upload only sends the bytes. Files up to 20 MB: run the returned curl (multipart; omit name to use the local file's name). Larger files: run curl_chunked, which PUTs 20 MB parts with ?part=N and then polls POST ?complete=N until assembly finishes (202 while assembling, 201/200 when done). Pass local_path to get commands that run as is. The URL stops working after one successful upload. Pass file to upload a new version of an existing file instead.", additive, s.uploadURL)
 	add(srv, "replace_file", "Replace a file's content, keeping its URL and password. The previous content stays available as an older version for the retention window. Give exactly one of content_text, content_base64 or source_url.", fetching, s.replace)
 	mcp.AddTool(srv, &mcp.Tool{Name: "read_file", Description: "Read a file's content (current or an older version). Text comes back as text, other files as base64; images are also returned as images.", Annotations: readOnly}, s.read)
 	add(srv, "create_download_url", "Get a short-lived private URL for the exact bytes of a version of a file. It works even for restricted (password or email) or deleted files.", readOnly, s.downloadURL)
@@ -406,19 +406,31 @@ func (s *server) uploadURL(ctx context.Context, in UploadURLInput) (uploadURLOut
 	}
 	u := s.files.BaseURL() + "/upload/" + s.auth.SignUpload(created.ID, ttl)
 	// The placeholder stays unquoted so existing scripts that substitute it keep working.
-	local, field := "./LOCAL_FILE", "'file=@./LOCAL_FILE'"
+	field := "'file=@./LOCAL_FILE'"
 	if in.LocalPath != "" {
-		local, field = shellQuote(in.LocalPath), shellQuote("file=@"+in.LocalPath)
+		field = shellQuote("file=@" + in.LocalPath)
 	}
 	return uploadURLOutput{
 		UploadURL: u, SingleUse: true, ExpiresAt: created.ExpiresAt.Truncate(time.Second),
 		URL: created.URL, Namespace: created.Namespace,
 		Curl:               fmt.Sprintf("curl -sS --fail-with-body -F %s '%s'", field, u),
-		MaxSingleRequestMB: 95,
-		CurlChunked: fmt.Sprintf(`f=%s; u='%s'; d=$(mktemp -d) && split -b 90m "$f" "$d/p." && n=0 && `+
-			`for p in "$d"/p.*; do n=$((n+1)); curl -sS --fail-with-body -X PUT --upload-file "$p" "$u?part=$n" >/dev/null || exit 1; done && `+
-			`curl -sS --fail-with-body -X POST -G --data-urlencode "complete=$n" --data-urlencode "name=${f##*/}" "$u"; rm -rf "$d"`, local, u),
+		MaxSingleRequestMB: 20,
+		CurlChunked:        CurlChunked(u, in.LocalPath),
 	}, nil
+}
+
+// CurlChunked returns the POSIX shell command that splits localPath (or
+// ./LOCAL_FILE when empty) into 20 MiB parts, uploads them to uploadURL, and
+// polls ?complete=N across 202 responses until assembly finishes.
+func CurlChunked(uploadURL, localPath string) string {
+	local := "./LOCAL_FILE"
+	if localPath != "" {
+		local = shellQuote(localPath)
+	}
+	return fmt.Sprintf(`f=%s; u='%s'; d=$(mktemp -d) && split -b 20m "$f" "$d/p." && n=0 && `+
+		`for p in "$d"/p.*; do n=$((n+1)); curl -sS --retry 5 --retry-all-errors --retry-delay 2 --fail-with-body -X PUT --upload-file "$p" "$u?part=$n" >/dev/null || { rm -rf "$d"; exit 1; }; done && `+
+		`while :; do c=$(curl -sS --retry 5 --retry-all-errors --retry-delay 2 -o "$d/out" -w '%%{http_code}' -X POST -G --data-urlencode "complete=$n" --data-urlencode "name=${f##*/}" "$u") || { rm -rf "$d"; exit 1; }; [ "$c" = 202 ] || break; sleep 2; done; `+
+		`cat "$d/out"; rm -rf "$d"; case "$c" in 200|201) ;; *) exit 1;; esac`, local, uploadURL)
 }
 
 // shellQuote quotes s as one single-quoted POSIX shell word.

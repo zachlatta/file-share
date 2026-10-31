@@ -12,7 +12,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -21,6 +25,7 @@ import (
 	"github.com/zachlatta/file-share/internal/blob"
 	"github.com/zachlatta/file-share/internal/files"
 	"github.com/zachlatta/file-share/internal/hcauth"
+	"github.com/zachlatta/file-share/internal/mcpserver"
 	"github.com/zachlatta/file-share/internal/pgtest"
 )
 
@@ -464,5 +469,178 @@ func TestChunkedSignedUpload(t *testing.T) {
 	_ = e.do(httptest.NewRequest(http.MethodPut, path+"?part=1", strings.NewReader("v2")))
 	if rec := e.do(httptest.NewRequest(http.MethodPost, path+"?complete=1", nil)); rec.Code != 200 || decodeFile(t, rec).Version != 2 {
 		t.Fatalf("chunked replace: %d %s", rec.Code, rec.Body)
+	}
+}
+
+type gatedBlobs struct {
+	*blob.Memory
+	gate       <-chan struct{}
+	once       sync.Once
+	onFirstGet func()
+}
+
+func (g *gatedBlobs) Get(ctx context.Context, key string) (blob.Object, error) {
+	if strings.HasPrefix(key, "uploads/") {
+		if g.onFirstGet != nil {
+			g.once.Do(g.onFirstGet)
+		}
+		select {
+		case <-g.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return g.Memory.Get(ctx, key)
+}
+
+func TestChunkedSignedUploadPolls202UntilComplete(t *testing.T) {
+	gate := make(chan struct{})
+	svc, err := files.Open(context.Background(), files.Config{
+		DatabaseURL: pgtest.New(t), Blobs: &gatedBlobs{Memory: blob.NewMemory(), gate: gate},
+		BaseURL: "https://files.example.com", Retention: 30 * 24 * time.Hour, MaxBytes: 1 << 20,
+		CompleteWait: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(svc.Close)
+	a := auth.NewService(auth.Config{Secret: secret, BaseURL: "https://files.example.com"})
+	mux := http.NewServeMux()
+	New(Config{Files: svc, Auth: a, Version: "test"}).Register(mux)
+	e := &env{files: svc, auth: a, handler: mux}
+
+	path := e.link(t, files.UploadLinkInput{})
+	for i, chunk := range []string{"slow-", "join"} {
+		rec := e.do(httptest.NewRequest(http.MethodPut, fmt.Sprintf("%s?part=%d", path, i+1), strings.NewReader(chunk)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("part %d: %d %s", i+1, rec.Code, rec.Body)
+		}
+	}
+
+	// First completion request exceeds CompleteWait while the background join is running.
+	rec := e.do(httptest.NewRequest(http.MethodPost, path+"?complete=2&name=big.zip", nil))
+	if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"status":"assembling"`) {
+		t.Fatalf("poll 1: %d %s", rec.Code, rec.Body)
+	}
+
+	// Release the join; the next poll receives 201 Created with the assembled File.
+	close(gate)
+	rec = e.do(httptest.NewRequest(http.MethodPost, path+"?complete=2&name=big.zip", nil))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("poll 2: %d %s", rec.Code, rec.Body)
+	}
+	f := decodeFile(t, rec)
+	if f.Name != "big.zip" || f.Size != 9 {
+		t.Fatalf("file = %+v", f)
+	}
+
+	// Retrying ?complete= after completion still returns 201 Created with the File,
+	// even though the parts have already been deleted.
+	rec = e.do(httptest.NewRequest(http.MethodPost, path+"?complete=2&name=big.zip", nil))
+	if rec.Code != http.StatusCreated || decodeFile(t, rec).ID != f.ID {
+		t.Fatalf("idempotent complete retry: %d %s", rec.Code, rec.Body)
+	}
+
+	// Single-request upload and part PUT still return 410 Gone once used.
+	if rec := e.do(httptest.NewRequest(http.MethodPut, path, strings.NewReader("x"))); rec.Code != http.StatusGone {
+		t.Fatalf("single upload after complete: %d", rec.Code)
+	}
+
+	// Execute the generated curl_chunked shell command end-to-end across a 202 -> 201 transition,
+	// using a pending namespace created by a prior unused upload link.
+	if _, err := exec.LookPath("curl"); err == nil {
+		shellGate := make(chan struct{})
+		srv := httptest.NewServer(mux)
+		defer srv.Close()
+		svc2, err := files.Open(context.Background(), files.Config{
+			DatabaseURL: pgtest.New(t),
+			Blobs: &gatedBlobs{
+				Memory: blob.NewMemory(),
+				gate:   shellGate,
+				onFirstGet: func() {
+					go func() {
+						time.Sleep(150 * time.Millisecond)
+						close(shellGate)
+					}()
+				},
+			},
+			BaseURL: srv.URL, Retention: 30 * 24 * time.Hour, MaxBytes: 1 << 20,
+			CompleteWait: 30 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(svc2.Close)
+		mux2 := http.NewServeMux()
+		a2 := auth.NewService(auth.Config{Secret: secret, BaseURL: srv.URL})
+		New(Config{Files: svc2, Auth: a2, Version: "test"}).Register(mux2)
+		var completePolls atomic.Int32
+		srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Query().Get("complete") != "" {
+				completePolls.Add(1)
+			}
+			mux2.ServeHTTP(w, r)
+		})
+
+		firstLink, err := svc2.CreateUploadLink(context.Background(), files.UploadLinkInput{Name: "first.bin", ExpiresAt: time.Now().Add(time.Hour)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondLink, err := svc2.CreateUploadLink(context.Background(), files.UploadLinkInput{Namespace: firstLink.Namespace, Name: "second.bin", ExpiresAt: time.Now().Add(time.Hour)})
+		if err != nil || secondLink.Namespace != firstLink.Namespace {
+			t.Fatalf("second link in pending namespace: %+v, %v", secondLink, err)
+		}
+		token := a2.SignUpload(secondLink.ID, time.Hour)
+		samplePath := filepath.Join(t.TempDir(), "it's multi.bin")
+		wantBody := bytes.Repeat([]byte("0123456789abcdef"), 600) // 9600 bytes -> 3 x 4KB parts
+		if err := os.WriteFile(samplePath, wantBody, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cmdStr := strings.Replace(mcpserver.CurlChunked(srv.URL+"/upload/"+token, samplePath), "split -b 20m", "split -b 4k", 1)
+		out, err := exec.Command("sh", "-c", cmdStr).CombinedOutput()
+		if err != nil {
+			t.Fatalf("curl_chunked sh failed: %v\n%s", err, out)
+		}
+		if completePolls.Load() < 2 {
+			t.Fatalf("completePolls = %d, want >= 2 (202 then 201)", completePolls.Load())
+		}
+		var uploaded files.File
+		if err := json.Unmarshal(out, &uploaded); err != nil || uploaded.Namespace != firstLink.Namespace || uploaded.Size != int64(len(wantBody)) {
+			t.Fatalf("curl_chunked output = %s, err = %v", out, err)
+		}
+		resp, err := http.Get(uploaded.URL)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET uploaded.URL: %v, %v", resp, err)
+		}
+		gotBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if !bytes.Equal(gotBody, wantBody) {
+			t.Fatalf("downloaded body len=%d, want %d", len(gotBody), len(wantBody))
+		}
+	}
+}
+
+type canceledReader struct{ cancel context.CancelFunc }
+
+func (c canceledReader) Read([]byte) (int, error) {
+	c.cancel()
+	return 0, context.Canceled
+}
+
+func TestClientCanceledUploadReturns499(t *testing.T) {
+	e := newEnv(t)
+	path := e.link(t, files.UploadLinkInput{Name: "aborted.bin"})
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPut, path, canceledReader{cancel: cancel}).WithContext(ctx)
+	if rec := e.do(req); rec.Code != StatusClientClosedRequest {
+		t.Fatalf("canceled raw upload: %d %s, want 499", rec.Code, rec.Body)
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	req2 := httptest.NewRequest(http.MethodPost, "/api/files", canceledReader{cancel: cancel2}).WithContext(ctx2)
+	req2.Header.Set("Content-Type", "multipart/form-data; boundary=abc")
+	req2.Header.Set("Authorization", "Bearer curl:"+secret)
+	if rec := e.do(req2); rec.Code != StatusClientClosedRequest {
+		t.Fatalf("canceled multipart upload: %d %s, want 499", rec.Code, rec.Body)
 	}
 }
