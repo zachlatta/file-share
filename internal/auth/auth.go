@@ -388,7 +388,9 @@ func (s *Service) staticClient(credential string) (string, bool) {
 
 // SignUpload signs a URL token for the single-use upload link linkID, so an
 // agent can hand a short-lived URL to curl without the secret. The link's
-// settings and whether it has been used live in the database.
+// settings and whether it has been used live in the database. Exp records the
+// original start deadline for compatibility; verification delegates deadline
+// enforcement to that row and its stored parts, which may extend eligibility.
 func (s *Service) SignUpload(linkID string, ttl time.Duration) string {
 	token, _ := s.sign(signedPayload{Type: "upload", LinkID: linkID, Nonce: nonce(), Exp: s.now().Add(ttl).Unix(), Iat: s.now().Unix()})
 	return token

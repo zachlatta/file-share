@@ -60,7 +60,9 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
   tool returns a ready-made `curl_chunked` script (requires curl, split and jq) with retries and completion polling.
   Rerun it after interruption: it queries `GET <upload_url>?status` and skips stored parts
   whose sizes match. Status returns `{parts:[{n,size}],state:"pending|assembling|done",file?:...}`
-  without consuming the link; completed links return the resulting file. Use the same local
+  without consuming the link; completed links return the resulting file until hourly cleanup
+  removes them, only after the start deadline and at least 24 hours after the upload
+  was claimed for completion. Use the same local
   file when resuming: matching sizes do not verify matching content. Pass
   `local_path` and both commands name your file, so they run as is; without it they use a
   `./LOCAL_FILE` placeholder. All unfinished parts are retained until 24 hours after the latest part.

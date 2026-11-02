@@ -460,6 +460,9 @@ func TestUploadDeadlineIsStartDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.clock.t = h.clock.t.Add(61 * time.Minute)
+	if _, err := h.svc.Purge(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := h.svc.UploadLink(ctx, active.ID); err != nil {
 		t.Fatalf("active expired: %v", err)
 	}
@@ -478,7 +481,21 @@ func TestUploadDeadlineIsStartDeadline(t *testing.T) {
 	if err != nil || f.Size != 2 {
 		t.Fatalf("complete: %+v %v", f, err)
 	}
+	h.clock.t = h.clock.t.Add(time.Hour)
+	if _, err := h.svc.Purge(ctx); err != nil {
+		t.Fatal(err)
+	}
+	status, err := h.svc.UploadLinkStatus(ctx, active.ID)
+	if err != nil || status.State != "done" {
+		t.Fatalf("completed status after purge: %+v %v", status, err)
+	}
 	h.clock.t = h.clock.t.Add(partTTL)
+	if _, err := h.svc.Purge(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.UploadLinkStatus(ctx, active.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("completed status retained too long: %v", err)
+	}
 	stale, _ := h.svc.CreateUploadLink(ctx, UploadLinkInput{Name: "stale", ExpiresAt: h.clock.t.Add(time.Minute)})
 	sum = sha256.Sum256([]byte(stale.ID))
 	key = hex.EncodeToString(sum[:16])

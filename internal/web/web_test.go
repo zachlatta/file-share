@@ -665,3 +665,103 @@ func TestClientCanceledUploadReturns499(t *testing.T) {
 		t.Fatalf("canceled multipart upload: %d %s, want 499", rec.Code, rec.Body)
 	}
 }
+
+// Exercise the actual generated script and real curl processes, including a
+// killed process group, rather than pre-populating the first part.
+func TestCurlChunkedKilledRunResumesAfterPurge(t *testing.T) {
+	ctx := context.Background()
+	var clock atomic.Int64
+	clock.Store(time.Now().Unix())
+	now := func() time.Time { return time.Unix(clock.Load(), 0) }
+	mem := blob.NewMemory()
+	mem.Now = now
+	srv := httptest.NewUnstartedServer(nil)
+	svc, err := files.Open(ctx, files.Config{
+		DatabaseURL: pgtest.New(t), Blobs: mem, Now: now,
+		Retention: 30 * 24 * time.Hour, MaxBytes: 60 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	a := auth.NewService(auth.Config{Secret: secret})
+	mux := http.NewServeMux()
+	New(Config{Files: svc, Auth: a}).Register(mux)
+	second := make(chan struct{})
+	release := make(chan struct{})
+	var puts atomic.Int32
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			if puts.Add(1) == 2 {
+				close(second)
+				<-release
+				return // interrupted request never reaches part storage
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
+	srv.Start()
+	defer srv.Close()
+	link, err := svc.CreateUploadLink(ctx, files.UploadLinkInput{Name: "resume.bin", ExpiresAt: now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "resume.bin")
+	body := bytes.Repeat([]byte("0123456789abcdef"), 3<<20) // 48 MiB, three real 20 MiB chunks
+	if err := os.WriteFile(path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	script := mcpserver.CurlChunked(srv.URL+"/upload/"+a.SignUpload(link.ID, time.Hour), path)
+	cmd := exec.Command("sh", "-c", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-second:
+	case <-time.After(30 * time.Second):
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		cmd.Wait()
+		close(release)
+		t.Fatal("second part did not start")
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	cmd.Wait()
+	close(release)
+	clock.Add(int64((61 * time.Minute) / time.Second))
+	if _, err := svc.Purge(ctx); err != nil {
+		t.Fatal(err)
+	}
+	status, err := svc.UploadLinkStatus(ctx, link.ID)
+	if err != nil || len(status.Parts) != 1 || status.Parts[0].N != 1 {
+		t.Fatalf("interrupted: %+v %v", status, err)
+	}
+	before := puts.Load()
+	out, err := exec.Command("sh", "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("resume: %v %s", err, out)
+	}
+	if puts.Load()-before != 2 {
+		t.Fatalf("rerun sent %d parts, want 2", puts.Load()-before)
+	}
+	var f files.File
+	if err := json.Unmarshal(out, &f); err != nil {
+		t.Fatal(err)
+	}
+	obj, _, err := svc.Open(ctx, f.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(obj)
+	obj.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHash, gotHash := sha256.Sum256(body), sha256.Sum256(got)
+	if wantHash != gotHash {
+		t.Fatal("SHA-256 mismatch")
+	}
+	t.Logf("killed at part 2; purge at +61m retained part 1; rerun sent only parts 2 and 3; SHA-256=%x", gotHash)
+}

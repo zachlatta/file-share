@@ -665,9 +665,32 @@ func (s *Service) Purge(ctx context.Context) (PurgeResult, error) {
 			return err
 		}
 		res.Files = int(tag.RowsAffected())
-		tag, err = tx.Exec(ctx, `DELETE FROM upload_links WHERE expires_at <= $1`, s.nowUTC())
-		res.Links = int(tag.RowsAffected())
-		return err
+		// Preserve recent completion results even though assembly removes their parts.
+		rows, err = tx.Query(ctx, `SELECT id::text FROM upload_links
+			WHERE expires_at <= $1 AND (used_at IS NULL OR used_at <= $2)`,
+			s.nowUTC(), s.nowUTC().Add(-partTTL))
+		if err != nil {
+			return err
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			active, err := s.activeParts(ctx, id)
+			if err != nil {
+				return err
+			}
+			if active || s.hasCompleting(linkPartKey(id)) {
+				continue
+			}
+			tag, err := tx.Exec(ctx, `DELETE FROM upload_links WHERE id = $1`, id)
+			if err != nil {
+				return err
+			}
+			res.Links += int(tag.RowsAffected())
+		}
+		return nil
 	})
 	if err != nil {
 		// The sweeps below need the database too; the next purge retries.

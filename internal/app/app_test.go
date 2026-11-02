@@ -268,5 +268,4 @@ func TestChunkedUploadStatus(t *testing.T) {
 	if status.State != "done" || status.File == nil || status.File.Size != 6 {
 		t.Fatalf("done: %+v", status)
 	}
-	// Completion metadata remains accessible after the start deadline.
 }
