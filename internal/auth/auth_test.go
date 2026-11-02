@@ -317,8 +317,8 @@ func TestSignedURLs(t *testing.T) {
 		t.Fatalf("verify upload: %q %v", link, err)
 	}
 	c.t = c.t.Add(2 * time.Hour)
-	if _, err := s.VerifyUpload(token); err == nil {
-		t.Fatal("expired upload grant accepted")
+	if _, err := s.VerifyUpload(token); err != nil {
+		t.Fatal("upload deadline must be checked against persisted activity")
 	}
 	if _, err := s.VerifyUpload(token + "x"); err == nil {
 		t.Fatal("tampered upload grant accepted")

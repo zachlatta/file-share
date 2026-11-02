@@ -400,9 +400,7 @@ func (s *Service) VerifyUpload(token string) (string, error) {
 	if err := s.verify(token, "upload", &p); err != nil {
 		return "", err
 	}
-	if s.now().Unix() > p.Exp {
-		return "", errors.New("upload URL expired")
-	}
+	// Upload deadlines are enforced by the persisted link and part activity.
 	if p.LinkID == "" {
 		return "", errors.New("upload URL has no link")
 	}

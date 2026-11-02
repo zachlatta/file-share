@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/zachlatta/file-share/internal/auth"
 	"github.com/zachlatta/file-share/internal/blob"
 	"github.com/zachlatta/file-share/internal/config"
+	"github.com/zachlatta/file-share/internal/files"
 	"github.com/zachlatta/file-share/internal/pgtest"
 )
 
@@ -228,4 +230,43 @@ func TestMCPToolCallWithStaticBearer(t *testing.T) {
 	if status, _ := call("Bearer script:wrong", body); status != http.StatusUnauthorized {
 		t.Fatalf("wrong secret: %d", status)
 	}
+}
+
+func TestChunkedUploadStatus(t *testing.T) {
+	srv, a := start(t)
+	ctx := context.Background()
+	link, err := a.files.CreateUploadLink(ctx, files.UploadLinkInput{Name: "resume.bin", ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authService := auth.NewService(auth.Config{Secret: secret})
+	u := srv.URL + "/upload/" + authService.SignUpload(link.ID, time.Hour)
+	request := func(method, suffix, body string) []byte {
+		t.Helper()
+		req, _ := http.NewRequest(method, u+suffix, strings.NewReader(body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 300 {
+			t.Fatalf("%s: %d %s", suffix, resp.StatusCode, data)
+		}
+		return data
+	}
+	request("PUT", "?part=1", "a")
+	request("PUT", "?part=3", "ccc")
+	var status files.UploadStatus
+	json.Unmarshal(request("GET", "?status", ""), &status)
+	if status.State != "pending" || len(status.Parts) != 2 || status.Parts[0].N != 1 || status.Parts[1].N != 3 || status.Parts[1].Size != 3 {
+		t.Fatalf("status: %+v", status)
+	}
+	request("PUT", "?part=2", "bb")
+	request("POST", "?complete=3", "")
+	json.Unmarshal(request("GET", "?status", ""), &status)
+	if status.State != "done" || status.File == nil || status.File.Size != 6 {
+		t.Fatalf("done: %+v", status)
+	}
+	// Completion metadata remains accessible after the start deadline.
 }

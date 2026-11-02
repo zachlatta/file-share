@@ -177,7 +177,7 @@ type UploadURLInput struct {
 	AllowedEmails   []string `json:"allowed_emails,omitempty" jsonschema:"Optional: only these people can open the new file, after signing in with Hack Club Auth. Exact addresses, or '@domain.com' for a whole domain."`
 	File            string   `json:"file,omitempty" jsonschema:"To replace an existing file instead: its ID, URL or namespace/name. Its name, password and allowed emails are kept."`
 	ExpectedVersion int      `json:"expected_version,omitempty" jsonschema:"With file: the version you read before editing. The upload is refused if the file has moved past it by then."`
-	ExpiresMinutes  int      `json:"expires_minutes,omitempty" jsonschema:"How long the URL works if unused (default 60, max 1440)."`
+	ExpiresMinutes  int      `json:"expires_minutes,omitempty" jsonschema:"Deadline to start uploading (default 60 minutes, max 1440). Stored parts extend it until 24 hours after the latest part."`
 	LocalPath       string   `json:"local_path,omitempty" jsonschema:"Optional: the path of the file on your machine. The returned curl commands use it, so they run as is. Omit to get a LOCAL_FILE placeholder."`
 }
 
@@ -464,8 +464,8 @@ func CurlChunked(uploadURL, localPath string) string {
 	if localPath != "" {
 		local = shellQuote(localPath)
 	}
-	return fmt.Sprintf(`f=%s; u='%s'; d=$(mktemp -d) && split -b 20m "$f" "$d/p." && n=0 && `+
-		`for p in "$d"/p.*; do n=$((n+1)); curl -sS --retry 5 --retry-all-errors --retry-delay 2 --fail-with-body -X PUT --upload-file "$p" "$u?part=$n" >/dev/null || { rm -rf "$d"; exit 1; }; done && `+
+	return fmt.Sprintf(`f=%s; u='%s'; command -v jq >/dev/null || { echo 'jq is required' >&2; exit 1; }; d=$(mktemp -d) || exit 1; curl -sS --retry 5 --retry-all-errors --fail-with-body "$u?status" >"$d/status" || { rm -rf "$d"; exit 1; }; if [ "$(jq -r .state "$d/status")" = done ]; then jq .file "$d/status"; rm -rf "$d"; exit 0; fi; split -b 20m "$f" "$d/p." && n=0 && `+
+		`for p in "$d"/p.*; do n=$((n+1)); size=$(wc -c <"$p"); if jq -e --argjson n "$n" --argjson size "$size" '.parts[] | select(.n == $n and .size == $size)' "$d/status" >/dev/null; then continue; fi; [ "$(jq -r .state "$d/status")" = assembling ] && continue; curl -sS --retry 5 --retry-all-errors --retry-delay 2 --fail-with-body -X PUT --upload-file "$p" "$u?part=$n" >/dev/null || { rm -rf "$d"; exit 1; }; done && `+
 		`while :; do c=$(curl -sS --retry 5 --retry-all-errors --retry-delay 2 -o "$d/out" -w '%%{http_code}' -X POST -G --data-urlencode "complete=$n" --data-urlencode "name=${f##*/}" "$u") || { rm -rf "$d"; exit 1; }; [ "$c" = 202 ] || break; sleep 2; done; `+
 		`cat "$d/out"; rm -rf "$d"; case "$c" in 200|201) ;; *) exit 1;; esac`, local, uploadURL)
 }

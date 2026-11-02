@@ -50,15 +50,20 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
   base64s big files through a chat message. The link fixes the name (optional: omit it to use
   the uploaded file's name), namespace, password and allowed emails; the upload only sends the
   bytes. It works once: a second upload returns `410 Gone`. A failed upload releases it for a
-  retry, and an unused link expires (default 60 minutes, max 24 hours). Proxies cap request
+  retry. The expiry is a deadline to start (default 60 minutes, max 24 hours).
+  Once a part is stored, the upload stays valid until 24 hours after the latest stored part. Proxies cap request
   bodies (Cloudflare rejects bodies over 100 MB) and time out slow single-stream uploads, so
   files over 20 MB go up in parts: `PUT <url>?part=1..N` (each part 20 MB or less), then poll
   `POST <url>?complete=N` (plus `&name=` if the link has no name), which assembles the parts in
   the background and returns `202 Accepted` (`{"status":"assembling"}`) if still running after
   60 seconds, then `201 Created` (or `200 OK` when replacing) with the file JSON once done. The
-  tool returns a ready-made `curl_chunked` script with retries and completion polling. Pass
+  tool returns a ready-made `curl_chunked` script (requires curl, split and jq) with retries and completion polling.
+  Rerun it after interruption: it queries `GET <upload_url>?status` and skips stored parts
+  whose sizes match. Status returns `{parts:[{n,size}],state:"pending|assembling|done",file?:...}`
+  without consuming the link; completed links return the resulting file. Use the same local
+  file when resuming: matching sizes do not verify matching content. Pass
   `local_path` and both commands name your file, so they run as is; without it they use a
-  `./LOCAL_FILE` placeholder. Unfinished parts are deleted after 24 hours.
+  `./LOCAL_FILE` placeholder. All unfinished parts are retained until 24 hours after the latest part.
   `create_download_url` does the same for downloads, including old versions, password-protected
   files and deleted files.
 

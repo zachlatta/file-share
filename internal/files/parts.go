@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/zachlatta/file-share/internal/blob"
@@ -205,10 +206,18 @@ func (s *Service) purgeParts(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	cutoff := s.now().Add(-partTTL)
+	latest := map[string]time.Time{}
+	for _, obj := range objects {
+		group, _, _ := strings.Cut(strings.TrimPrefix(obj.Key, "uploads/"), "/")
+		if obj.Modified.After(latest[group]) {
+			latest[group] = obj.Modified
+		}
+	}
 	deleted := 0
 	var errs []error
 	for _, obj := range objects {
-		if obj.Modified.Before(cutoff) {
+		group, _, _ := strings.Cut(strings.TrimPrefix(obj.Key, "uploads/"), "/")
+		if !latest[group].After(cutoff) && !s.hasCompleting(group) {
 			if err := s.blobs.Delete(ctx, obj.Key); err != nil {
 				errs = append(errs, err)
 				continue

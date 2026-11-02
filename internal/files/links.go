@@ -2,9 +2,12 @@ package files
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -140,6 +143,11 @@ func (s *Service) UploadLink(ctx context.Context, id string) (UploadLink, error)
 	case used != nil:
 		return UploadLink{}, ErrLinkUsed
 	case !link.ExpiresAt.After(s.nowUTC()):
+		if ok, err := s.activeParts(ctx, id); err != nil {
+			return UploadLink{}, err
+		} else if ok {
+			break
+		}
 		return UploadLink{}, fmt.Errorf("%w: upload link expired", ErrNotFound)
 	}
 	if link.Name != "" {
@@ -171,9 +179,6 @@ func (s *Service) UploadLinkForComplete(ctx context.Context, id, uploadKey strin
 	if link.Name != "" {
 		link.URL = s.URLFor(link.Namespace, link.Name)
 	}
-	if s.hasCompleting(uploadKey) {
-		return link, nil, nil
-	}
 	if resultFileID != "" {
 		f, err := s.Get(ctx, resultFileID)
 		if err != nil {
@@ -181,11 +186,20 @@ func (s *Service) UploadLinkForComplete(ctx context.Context, id, uploadKey strin
 		}
 		return link, &f, nil
 	}
+	if s.hasCompleting(uploadKey) {
+		return link, nil, nil
+	}
+
 	now := s.nowUTC()
 	if used != nil && used.After(now.Add(-s.completeTimeout)) {
 		return UploadLink{}, nil, ErrLinkUsed
 	}
 	if !link.ExpiresAt.After(now) {
+		if ok, err := s.activeParts(ctx, id); err != nil {
+			return UploadLink{}, nil, err
+		} else if ok {
+			return link, nil, nil
+		}
 		return UploadLink{}, nil, fmt.Errorf("%w: upload link expired", ErrNotFound)
 	}
 	return link, nil, nil
@@ -201,14 +215,18 @@ func (s *Service) UploadWithLink(ctx context.Context, id string, in LinkUpload) 
 	}
 	now := s.nowUTC()
 	staleCutoff := now.Add(-s.completeTimeout)
+	active, err := s.activeParts(ctx, id)
+	if err != nil {
+		return File{}, err
+	}
 	var ns, name, fileID, hash, client string
 	var emails []string
 	var expected int
 	var fileExpiresAt *time.Time
-	err := s.db.QueryRow(ctx, `UPDATE upload_links SET used_at = $2
-		WHERE id = $1 AND result_file_id IS NULL AND (used_at IS NULL OR used_at <= $3) AND expires_at > $2
+	err = s.db.QueryRow(ctx, `UPDATE upload_links SET used_at = $2
+		WHERE id = $1 AND result_file_id IS NULL AND (used_at IS NULL OR used_at <= $3) AND (expires_at > $2 OR $4)
 		RETURNING COALESCE(namespace::text, ''), name, COALESCE(file_id::text, ''), COALESCE(password_hash, ''), allowed_emails, client, expected_version, file_expires_at`,
-		id, now, staleCutoff).Scan(&ns, &name, &fileID, &hash, &emails, &client, &expected, &fileExpiresAt)
+		id, now, staleCutoff, active).Scan(&ns, &name, &fileID, &hash, &emails, &client, &expected, &fileExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		_, err = s.UploadLink(ctx, id)
 		if err == nil {
@@ -241,4 +259,65 @@ func (s *Service) UploadWithLink(ctx context.Context, id string, in LinkUpload) 
 		return File{}, err
 	}
 	return f, nil
+}
+
+// Link activity is derived from successfully stored parts, never request arrival.
+func linkPartKey(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:16])
+}
+
+func (s *Service) activeParts(ctx context.Context, id string) (bool, error) {
+	objects, err := s.blobs.List(ctx, "uploads/"+linkPartKey(id)+"/")
+	if err != nil {
+		return false, err
+	}
+	for _, obj := range objects {
+		if obj.Modified.After(s.nowUTC().Add(-partTTL)) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+type UploadPart struct {
+	N    int   `json:"n"`
+	Size int64 `json:"size"`
+}
+type UploadStatus struct {
+	Parts []UploadPart `json:"parts"`
+	State string       `json:"state"`
+	File  *File        `json:"file,omitempty"`
+}
+
+// UploadLinkStatus is non-consuming and requires the same grant as completion.
+func (s *Service) UploadLinkStatus(ctx context.Context, id string) (UploadStatus, error) {
+	key := linkPartKey(id)
+	_, f, err := s.UploadLinkForComplete(ctx, id, key)
+	if errors.Is(err, ErrLinkUsed) { // another instance may hold the assembly claim
+		return UploadStatus{Parts: []UploadPart{}, State: "assembling"}, nil
+	}
+	if err != nil {
+		return UploadStatus{}, err
+	}
+	status := UploadStatus{Parts: []UploadPart{}, State: "pending", File: f}
+	if f != nil {
+		status.State = "done"
+		return status, nil
+	}
+	if s.hasCompleting(key) {
+		status.State = "assembling"
+	}
+	objects, err := s.blobs.List(ctx, "uploads/"+key+"/")
+	if err != nil {
+		return UploadStatus{}, err
+	}
+	for _, obj := range objects {
+		var n int
+		if _, err := fmt.Sscanf(obj.Key, "uploads/"+key+"/%d", &n); err == nil {
+			status.Parts = append(status.Parts, UploadPart{N: n, Size: obj.Size})
+		}
+	}
+	sort.Slice(status.Parts, func(i, j int) bool { return status.Parts[i].N < status.Parts[j].N })
+	return status, nil
 }

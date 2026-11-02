@@ -3,6 +3,8 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -575,7 +577,11 @@ func TestChunkedSignedUploadPolls202UntilComplete(t *testing.T) {
 		a2 := auth.NewService(auth.Config{Secret: secret, BaseURL: srv.URL})
 		New(Config{Files: svc2, Auth: a2, Version: "test"}).Register(mux2)
 		var completePolls atomic.Int32
+		var uploadedParts atomic.Int32
 		srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut {
+				uploadedParts.Add(1)
+			}
 			if r.Method == http.MethodPost && r.URL.Query().Get("complete") != "" {
 				completePolls.Add(1)
 			}
@@ -596,10 +602,25 @@ func TestChunkedSignedUploadPolls202UntilComplete(t *testing.T) {
 		if err := os.WriteFile(samplePath, wantBody, 0o600); err != nil {
 			t.Fatal(err)
 		}
+		// Simulate a killed run with part 1 acknowledged before restarting.
+		sum := sha256.Sum256([]byte(secondLink.ID))
+		key := hex.EncodeToString(sum[:16])
+		if _, err := svc2.PutPart(context.Background(), key, 1, bytes.NewReader(wantBody[:4096]), 4096); err != nil {
+			t.Fatal(err)
+		}
 		cmdStr := strings.Replace(mcpserver.CurlChunked(srv.URL+"/upload/"+token, samplePath), "split -b 20m", "split -b 4k", 1)
 		out, err := exec.Command("sh", "-c", cmdStr).CombinedOutput()
 		if err != nil {
 			t.Fatalf("curl_chunked sh failed: %v\n%s", err, out)
+		}
+		if uploadedParts.Load() != 2 {
+			t.Fatalf("resume uploaded %d parts, want 2", uploadedParts.Load())
+		}
+		if _, err := exec.Command("sh", "-c", cmdStr).CombinedOutput(); err != nil {
+			t.Fatal(err)
+		}
+		if uploadedParts.Load() != 2 {
+			t.Fatal("done upload resent parts")
 		}
 		if completePolls.Load() < 2 {
 			t.Fatalf("completePolls = %d, want >= 2 (202 then 201)", completePolls.Load())

@@ -85,6 +85,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.Handle("DELETE /api/files/{id}", api(h.apiDelete))
 	mux.Handle("POST /api/files/{id}/restore", api(h.apiRestore))
 
+	mux.HandleFunc("GET /upload/{token}", h.signedUpload)
 	mux.HandleFunc("PUT /upload/{token}", h.signedUpload)
 	mux.HandleFunc("POST /upload/{token}", h.signedUpload)
 	mux.HandleFunc("GET /download/{token}", h.signedDownload)
@@ -673,6 +674,15 @@ func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	if r.Method == http.MethodGet {
+		if !q.Has("status") {
+			http.Error(w, "status required", http.StatusBadRequest)
+			return
+		}
+		status, err := h.files.UploadLinkStatus(r.Context(), linkID)
+		respond(w, http.StatusOK, status, err)
+		return
+	}
 	// Chunked mode, for bodies larger than a proxy allows in one request:
 	// PUT ?part=1..N, then POST ?complete=N.
 	sum := sha256.Sum256([]byte(linkID))

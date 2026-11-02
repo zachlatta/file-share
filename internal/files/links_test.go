@@ -448,3 +448,60 @@ func TestLinkFileExpiry(t *testing.T) {
 		}
 	}
 }
+
+func TestUploadDeadlineIsStartDeadline(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	active, _ := h.svc.CreateUploadLink(ctx, UploadLinkInput{Name: "active.bin", ExpiresAt: h.clock.t.Add(time.Hour)})
+	untouched, _ := h.svc.CreateUploadLink(ctx, UploadLinkInput{Name: "untouched.bin", ExpiresAt: h.clock.t.Add(time.Hour)})
+	sum := sha256.Sum256([]byte(active.ID))
+	key := hex.EncodeToString(sum[:16])
+	if _, err := h.svc.PutPart(ctx, key, 1, strings.NewReader("a"), 1); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.t = h.clock.t.Add(61 * time.Minute)
+	if _, err := h.svc.UploadLink(ctx, active.ID); err != nil {
+		t.Fatalf("active expired: %v", err)
+	}
+	if _, err := h.svc.UploadLink(ctx, untouched.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("untouched: %v", err)
+	}
+	if _, err := h.svc.PutPart(ctx, key, 2, strings.NewReader("b"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.svc.UploadLinkForComplete(ctx, active.ID, key); err != nil {
+		t.Fatal(err)
+	}
+	f, err := h.svc.CompleteParts(ctx, key, 2, func(ctx context.Context, r io.Reader) (File, error) {
+		return h.svc.UploadWithLink(ctx, active.ID, LinkUpload{Body: r, Size: -1})
+	})
+	if err != nil || f.Size != 2 {
+		t.Fatalf("complete: %+v %v", f, err)
+	}
+	h.clock.t = h.clock.t.Add(partTTL)
+	stale, _ := h.svc.CreateUploadLink(ctx, UploadLinkInput{Name: "stale", ExpiresAt: h.clock.t.Add(time.Minute)})
+	sum = sha256.Sum256([]byte(stale.ID))
+	key = hex.EncodeToString(sum[:16])
+	h.svc.PutPart(ctx, key, 1, strings.NewReader("a"), 1)
+	h.clock.t = h.clock.t.Add(partTTL)
+	if _, err := h.svc.UploadLink(ctx, stale.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("inactive: %v", err)
+	}
+}
+
+func TestActiveUploadRetainsEarlyParts(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	key := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	h.svc.PutPart(ctx, key, 1, strings.NewReader("a"), 1)
+	h.clock.t = h.clock.t.Add(23 * time.Hour)
+	h.svc.PutPart(ctx, key, 2, strings.NewReader("b"), 1)
+	h.clock.t = h.clock.t.Add(2 * time.Hour)
+	if n, err := h.svc.purgeParts(ctx); err != nil || n != 0 {
+		t.Fatalf("active parts purged: %d %v", n, err)
+	}
+	h.clock.t = h.clock.t.Add(22 * time.Hour)
+	if n, err := h.svc.purgeParts(ctx); err != nil || n != 2 {
+		t.Fatalf("inactive parts retained: %d %v", n, err)
+	}
+}
