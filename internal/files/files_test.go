@@ -673,3 +673,104 @@ func TestReplaceWithExpectedVersion(t *testing.T) {
 		t.Fatalf("unchecked replace: %+v %v", f, err)
 	}
 }
+
+func TestExpiryPurgeAndRestore(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	due := h.clock.t.Add(time.Minute)
+	future := due.Add(time.Hour)
+	expired, err := h.svc.Upload(ctx, UploadInput{Name: "expired.txt", Body: strings.NewReader("data"), Size: -1, ExpiresAt: &due})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := h.upload(t, "", "live.txt", "live")
+	if _, err := h.svc.SetExpiry(ctx, live.ID, &future); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.t = due
+	for range 2 {
+		if _, err := h.svc.Purge(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expired, err = h.svc.Get(ctx, expired.ID)
+	if err != nil || expired.DeletedAt == nil || !expired.DeletedAt.Equal(due) {
+		t.Fatalf("expired: %+v %v", expired, err)
+	}
+	events, err := h.svc.ListAccess(ctx, AccessQuery{FileID: expired.ID, Event: "expired"})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events: %+v %v", events, err)
+	}
+	live, err = h.svc.Get(ctx, live.ID)
+	if err != nil || live.DeletedAt != nil {
+		t.Fatalf("live: %+v %v", live, err)
+	}
+	expired, err = h.svc.Restore(ctx, expired.ID)
+	if err != nil || expired.ExpiresAt != nil || expired.DeletedAt != nil {
+		t.Fatalf("restore: %+v %v", expired, err)
+	}
+	if _, err := h.svc.Delete(ctx, live.ID); err != nil {
+		t.Fatal(err)
+	}
+	live, err = h.svc.Restore(ctx, live.ID)
+	if err != nil || live.ExpiresAt == nil || !live.ExpiresAt.Equal(future) {
+		t.Fatalf("future restore: %+v %v", live, err)
+	}
+}
+
+func TestExpiryOptions(t *testing.T) {
+	h := newHarness(t)
+	good := "2027-01-02T03:04:05-05:00"
+	bad := "tomorrow"
+	one, zero, negative, huge := 1, 0, -1, int(^uint(0)>>1)
+	for _, tt := range []struct {
+		at    *string
+		days  *int
+		valid bool
+	}{
+		{nil, nil, true}, {&good, nil, true}, {nil, &one, true}, {&bad, nil, false}, {&good, &one, false}, {nil, &zero, false}, {nil, &negative, false}, {nil, &huge, false},
+	} {
+		got, err := h.svc.ResolveExpiry(tt.at, tt.days)
+		if (err == nil) != tt.valid {
+			t.Fatalf("options %+v: %v", tt, err)
+		}
+		if tt.days == &one && tt.at == nil && (got == nil || !got.Equal(h.clock.t.Add(24*time.Hour))) {
+			t.Fatalf("relative expiry: %v", got)
+		}
+	}
+	ctx := context.Background()
+	f := h.upload(t, "", "cleared.txt", "data")
+	due := h.clock.t.Add(time.Minute)
+	if _, err := h.svc.SetExpiry(ctx, f.ID, &due); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := h.svc.SetExpiry(ctx, f.ID, nil); err != nil || f.ExpiresAt != nil {
+		t.Fatalf("clear: %+v %v", f, err)
+	}
+}
+
+func TestExpiryStartsRetentionAtPurge(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	due := h.clock.t.Add(time.Minute)
+	f, err := h.svc.Upload(ctx, UploadInput{Name: "retained.txt", Body: strings.NewReader("data"), Size: -1, ExpiresAt: &due})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A delayed purge must not consume the recovery window.
+	h.clock.t = due.Add(60 * 24 * time.Hour)
+	if _, err := h.svc.Purge(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f, err = h.svc.Get(ctx, f.ID)
+	if err != nil || f.DeletedAt == nil || !f.DeletedAt.Equal(h.clock.t) || h.read(t, f, 0) != "data" {
+		t.Fatalf("retained: %+v %v", f, err)
+	}
+	h.clock.t = h.clock.t.Add(30 * 24 * time.Hour)
+	if _, err := h.svc.Purge(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.Get(ctx, f.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("purge after retention: %v", err)
+	}
+}

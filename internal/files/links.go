@@ -17,6 +17,8 @@ import (
 // only supplies the bytes and, when the link has no name, the file name.
 
 type UploadLinkInput struct {
+	// FileExpiresAt is the resulting file expiry, distinct from the link deadline.
+	FileExpiresAt *time.Time
 	// Namespace is an existing namespace (its UUID or URL), or empty for a
 	// new one. The namespace is chosen when the link is made, so its URL is
 	// known early.
@@ -61,8 +63,8 @@ func (s *Service) CreateUploadLink(ctx context.Context, in UploadLinkInput) (Upl
 	var hash string
 	var emails []string
 	if in.FileID != "" {
-		if in.Name != "" || in.Namespace != "" || in.Password != "" || len(in.AllowedEmails) > 0 {
-			return UploadLink{}, fmt.Errorf("%w: a replace link keeps the file's name, password and allowed emails; change those separately", ErrInvalid)
+		if in.Name != "" || in.Namespace != "" || in.Password != "" || len(in.AllowedEmails) > 0 || in.FileExpiresAt != nil {
+			return UploadLink{}, fmt.Errorf("%w: a replace link keeps the file's name, password, allowed emails and expiry; change those separately", ErrInvalid)
 		}
 		f, err := s.Get(ctx, in.FileID)
 		if err != nil {
@@ -111,9 +113,9 @@ func (s *Service) CreateUploadLink(ctx context.Context, in UploadLinkInput) (Upl
 			link.URL = s.URLFor(link.Namespace, link.Name)
 		}
 	}
-	_, err := s.db.Exec(ctx, `INSERT INTO upload_links (id, namespace, name, file_id, password_hash, allowed_emails, client, created_at, expires_at, expected_version)
-		VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, '')::uuid, NULLIF($5, ''), $6, $7, $8, $9, $10)`,
-		link.ID, link.Namespace, link.Name, link.FileID, hash, append([]string{}, emails...), in.Client, s.nowUTC(), link.ExpiresAt, in.ExpectedVersion)
+	_, err := s.db.Exec(ctx, `INSERT INTO upload_links (id, namespace, name, file_id, password_hash, allowed_emails, client, created_at, expires_at, expected_version, file_expires_at)
+		VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, '')::uuid, NULLIF($5, ''), $6, $7, $8, $9, $10, $11)`,
+		link.ID, link.Namespace, link.Name, link.FileID, hash, append([]string{}, emails...), in.Client, s.nowUTC(), link.ExpiresAt, in.ExpectedVersion, in.FileExpiresAt)
 	if err != nil {
 		return UploadLink{}, err
 	}
@@ -202,10 +204,11 @@ func (s *Service) UploadWithLink(ctx context.Context, id string, in LinkUpload) 
 	var ns, name, fileID, hash, client string
 	var emails []string
 	var expected int
+	var fileExpiresAt *time.Time
 	err := s.db.QueryRow(ctx, `UPDATE upload_links SET used_at = $2
 		WHERE id = $1 AND result_file_id IS NULL AND (used_at IS NULL OR used_at <= $3) AND expires_at > $2
-		RETURNING COALESCE(namespace::text, ''), name, COALESCE(file_id::text, ''), COALESCE(password_hash, ''), allowed_emails, client, expected_version`,
-		id, now, staleCutoff).Scan(&ns, &name, &fileID, &hash, &emails, &client, &expected)
+		RETURNING COALESCE(namespace::text, ''), name, COALESCE(file_id::text, ''), COALESCE(password_hash, ''), allowed_emails, client, expected_version, file_expires_at`,
+		id, now, staleCutoff).Scan(&ns, &name, &fileID, &hash, &emails, &client, &expected, &fileExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		_, err = s.UploadLink(ctx, id)
 		if err == nil {
@@ -226,7 +229,7 @@ func (s *Service) UploadWithLink(ctx context.Context, id string, in LinkUpload) 
 		if name == "" {
 			name = in.Name
 		}
-		f, err = s.upload(ctx, UploadInput{Namespace: ns, Name: name, ContentType: in.ContentType, Body: in.Body, Size: in.Size, AllowedEmails: emails, Client: client}, hash)
+		f, err = s.upload(ctx, UploadInput{Namespace: ns, Name: name, ContentType: in.ContentType, Body: in.Body, Size: in.Size, AllowedEmails: emails, Client: client, ExpiresAt: fileExpiresAt}, hash)
 	}
 	if err != nil {
 		if _, releaseErr := s.db.Exec(context.WithoutCancel(ctx), `UPDATE upload_links SET used_at = NULL WHERE id = $1 AND result_file_id IS NULL`, id); releaseErr != nil {

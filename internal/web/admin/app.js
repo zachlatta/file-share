@@ -74,7 +74,7 @@
       const protection = [];
       if (f.has_password) protection.push("password");
       if (f.allowed_emails && f.allowed_emails.length) protection.push(f.allowed_emails.join(", "));
-      row.append(name, el("td", protection.join(" + "), "wrap"), el("td", f.views), el("td", f.viewers), el("td", f.denied), el("td", when(f.last_viewed_at)));
+      row.append(name, el("td", protection.join(" + ") || "Public", "wrap"), el("td", when(f.expires_at)), el("td", f.views), el("td", f.viewers), el("td", f.denied), el("td", when(f.last_viewed_at)));
       const action = el("td");
       const button = el("button", "Show log", "link");
       button.type = "button";
@@ -145,7 +145,7 @@
       const row = el("tr");
       const event = el("td");
       event.append(el("span", e.event.replace(/_/g, " "), "badge " + e.event));
-      const ip = el("td", e.ip + (e.country ? " · " + e.country : ""));
+      const ip = el("td", (e.ip || "—") + (e.country ? " · " + e.country : ""));
       ip.title = "socket " + (e.remote_addr || "?") + (e.forwarded_for ? "; X-Forwarded-For " + e.forwarded_for : "");
       const ua = el("td", e.user_agent, "wrap");
       row.append(

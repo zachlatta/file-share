@@ -91,3 +91,48 @@ func TestAPIManagesAndDownloadsFiles(t *testing.T) {
 		t.Fatalf("download deleted: %d", rec.Code)
 	}
 }
+
+func TestAPIExpiry(t *testing.T) {
+	e := newEmailEnv(t)
+	rec := e.api(http.MethodPost, "/api/files?name=expire.txt&expires_at=2030-01-01T00:00:00Z", "expiry")
+	if rec.Code != 201 || !strings.Contains(rec.Body.String(), `"expires_at":"2030-01-01T00:00:00Z"`) {
+		t.Fatalf("expiry upload: %d %s", rec.Code, rec.Body)
+	}
+	f := decodeFile(t, rec)
+	rec = e.api(http.MethodPatch, "/api/files/"+f.ID, `{"name":"renamed.txt"}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"expires_at":"2030-01-01T00:00:00Z"`) {
+		t.Fatalf("expiry omission: %d %s", rec.Code, rec.Body)
+	}
+	for _, body := range []string{`{"expires_at":"bad","name":"bad.txt"}`, `{"expires_in_days":0}`, `{"expires_at":null,"expires_in_days":2}`} {
+		rec = e.api(http.MethodPatch, "/api/files/"+f.ID, body)
+		if rec.Code != 400 {
+			t.Fatalf("invalid expiry %s: %d %s", body, rec.Code, rec.Body)
+		}
+	}
+	rec = e.api(http.MethodPatch, "/api/files/"+f.ID, `{"expires_at":null}`)
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), `"expires_at":"`) {
+		t.Fatalf("expiry clear: %d %s", rec.Code, rec.Body)
+	}
+	rec = e.api(http.MethodPatch, "/api/files/"+f.ID, `{"expires_in_days":2}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"expires_at":"`) {
+		t.Fatalf("relative expiry: %d %s", rec.Code, rec.Body)
+	}
+	for _, query := range []string{"expires_at=bad", "expires_in_days=0", "expires_in_days=1.5", "expires_at=2030-01-01T00:00:00Z&expires_in_days=2"} {
+		rec = e.api(http.MethodPost, "/api/files?name=invalid.txt&"+query, "x")
+		if rec.Code != 400 {
+			t.Fatalf("invalid upload %s: %d %s", query, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestAPIMultipartExpiry(t *testing.T) {
+	e := newEnv(t)
+	body, ct := multipartBody(t, "form.txt", "expiry", map[string]string{"expires_at": "2030-01-01T00:00:00Z"})
+	req := httptest.NewRequest(http.MethodPost, "/api/files", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("Authorization", "Bearer curl:"+secret)
+	rec := e.do(req)
+	if rec.Code != 201 || !strings.Contains(rec.Body.String(), `"expires_at":"2030-01-01T00:00:00Z"`) {
+		t.Fatalf("multipart expiry: %d %s", rec.Code, rec.Body)
+	}
+}

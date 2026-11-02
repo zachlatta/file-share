@@ -20,7 +20,7 @@ type AccessEvent struct {
 	Name      string    `json:"name,omitempty"`
 	Version   int       `json:"version,omitempty"`
 	// Event is view, denied, wrong_password, unlock, sign_in or
-	// sign_in_failed.
+	// sign_in_failed, or expired (including public files).
 	Event string `json:"event"`
 	// Via is how access was granted: password_cookie, password_form,
 	// password_query, basic_auth, email or download_url.
@@ -111,8 +111,8 @@ func (s *Service) ListAccess(ctx context.Context, q AccessQuery) ([]AccessEvent,
 	})
 }
 
-// RestrictedFile summarizes a live file that has a password or allowed
-// emails, with its audit-log totals.
+// RestrictedFile summarizes a live file that has a password, allowed emails,
+// or an expiry, with its audit-log totals.
 type RestrictedFile struct {
 	File
 	Views int `json:"views"`
@@ -122,7 +122,7 @@ type RestrictedFile struct {
 	LastViewedAt *time.Time `json:"last_viewed_at,omitempty"`
 }
 
-// RestrictedFiles lists live restricted files, most recently updated first.
+// RestrictedFiles lists live restricted or expiring files, most recently updated first.
 func (s *Service) RestrictedFiles(ctx context.Context) ([]RestrictedFile, error) {
 	rows, err := s.db.Query(ctx, `SELECT `+fileColumns+`,
 			COALESCE(a.views, 0), COALESCE(a.viewers, 0), COALESCE(a.denied, 0), a.last_view`+fileFrom+`
@@ -132,7 +132,7 @@ func (s *Service) RestrictedFiles(ctx context.Context) ([]RestrictedFile, error)
 				count(*) FILTER (WHERE event = 'denied') AS denied,
 				max(at) FILTER (WHERE event = 'view') AS last_view
 			FROM access_events WHERE file_id = f.id) a ON true
-		WHERE f.deleted_at IS NULL AND (f.password_hash IS NOT NULL OR cardinality(f.allowed_emails) > 0)
+		WHERE f.deleted_at IS NULL AND (f.password_hash IS NOT NULL OR cardinality(f.allowed_emails) > 0 OR f.expires_at IS NOT NULL)
 		ORDER BY f.updated_at DESC, f.id LIMIT 1000`)
 	if err != nil {
 		return nil, err
@@ -142,7 +142,7 @@ func (s *Service) RestrictedFiles(ctx context.Context) ([]RestrictedFile, error)
 	for rows.Next() {
 		var r RestrictedFile
 		err := rows.Scan(&r.ID, &r.Namespace, &r.Name, &r.passwordHash, &r.Version, &r.CreatedAt, &r.UpdatedAt, &r.DeletedAt,
-			&r.Size, &r.ContentType, &r.SHA256, &r.AllowedEmails, &r.Views, &r.Viewers, &r.Denied, &r.LastViewedAt)
+			&r.Size, &r.ContentType, &r.SHA256, &r.AllowedEmails, &r.ExpiresAt, &r.Views, &r.Viewers, &r.Denied, &r.LastViewedAt)
 		if err != nil {
 			return nil, err
 		}

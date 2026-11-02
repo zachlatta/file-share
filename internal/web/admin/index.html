@@ -29,12 +29,12 @@
   </header>
 
   <section>
-    <h2>Protected files</h2>
+    <h2>Protected and expiring files</h2>
     <div class="scroll"><table id="files-table">
-      <thead><tr><th>File</th><th>Protection</th><th>Views</th><th>Viewers</th><th>Denied</th><th>Last viewed</th><th></th></tr></thead>
+      <thead><tr><th>File</th><th>Protection</th><th>Expires</th><th>Views</th><th>Viewers</th><th>Denied</th><th>Last viewed</th><th></th></tr></thead>
       <tbody></tbody>
     </table></div>
-    <p id="files-empty" class="hint" hidden>No files have a password or allowed emails.</p>
+    <p id="files-empty" class="hint" hidden>No files have protection or an expiry.</p>
   </section>
 
   <section>
@@ -63,6 +63,7 @@
         <option value="">All events</option>
         <option value="view">Views</option>
         <option value="denied">Denied</option>
+        <option value="expired">Expired</option>
         <option value="wrong_password">Wrong password</option>
         <option value="unlock">Password unlock</option>
         <option value="sign_in">Hack Club sign-in</option>

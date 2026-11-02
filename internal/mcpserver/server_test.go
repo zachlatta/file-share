@@ -344,3 +344,83 @@ func TestReplaceWithExpectedVersion(t *testing.T) {
 	var up uploadURLOutput
 	ok(t, call(t, s, "create_upload_url", map[string]any{"file": f.ID, "expected_version": 2}), &up)
 }
+
+func TestExpiryTools(t *testing.T) {
+	s, svc := connectWithService(t)
+	tools, err := s.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"upload_file", "create_upload_url", "set_expiry"} {
+		found := false
+		for _, tool := range tools.Tools {
+			if tool.Name == name {
+				found = true
+				schema, _ := json.Marshal(tool.InputSchema)
+				if !strings.Contains(string(schema), "expires_at") || !strings.Contains(string(schema), "expires_in_days") {
+					t.Errorf("%s lacks expiry schema: %s", name, schema)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("missing %s", name)
+		}
+	}
+	var f map[string]any
+	deadline := "2030-01-02T03:04:05Z"
+	ok(t, call(t, s, "upload_file", map[string]any{"name": "expiry.txt", "content_text": "expiry", "expires_at": deadline}), &f)
+	if f["expires_at"] != deadline {
+		t.Fatalf("expiry = %v", f)
+	}
+	id := f["id"]
+	ok(t, call(t, s, "get_file", map[string]any{"file": id}), &f)
+	if f["expires_at"] != deadline {
+		t.Fatalf("get expiry = %v", f)
+	}
+	ok(t, call(t, s, "set_expiry", map[string]any{"file": id, "expires_at": nil}), &f)
+	if f["expires_at"] != nil {
+		t.Fatalf("clear expiry = %v", f)
+	}
+	before := time.Now().Add(24 * time.Hour)
+	ok(t, call(t, s, "set_expiry", map[string]any{"file": id, "expires_in_days": 1}), &f)
+	at, err := time.Parse(time.RFC3339Nano, f["expires_at"].(string))
+	if err != nil || at.Before(before) || at.After(time.Now().Add(24*time.Hour)) {
+		t.Fatalf("relative expiry = %v, %v", f, err)
+	}
+	for _, args := range []map[string]any{{"expires_at": "bad"}, {"expires_in_days": 0}, {"expires_in_days": -1}, {"expires_at": deadline, "expires_in_days": 1}} {
+		args["name"], args["content_text"] = "invalid.txt", "x"
+		if !call(t, s, "upload_file", args).IsError {
+			t.Fatalf("accepted %v", args)
+		}
+	}
+	if !call(t, s, "set_expiry", map[string]any{"file": id, "expires_at": nil, "expires_in_days": 1}).IsError {
+		t.Fatal("null and days accepted")
+	}
+	if !call(t, s, "set_expiry", map[string]any{"file": id}).IsError {
+		t.Fatal("missing expiry accepted")
+	}
+	var link uploadURLOutput
+	ok(t, call(t, s, "create_upload_url", map[string]any{"name": "linked.txt", "expires_in_days": 1}), &link)
+	a := auth.NewService(auth.Config{Secret: "mcp-test-secret-0123456789-abcdef", BaseURL: "https://files.example.com"})
+	linkID, err := a.VerifyUpload(strings.TrimPrefix(link.UploadURL, "https://files.example.com/upload/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked, err := svc.UploadWithLink(t.Context(), linkID, files.LinkUpload{Body: strings.NewReader("linked"), Size: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked.ExpiresAt == nil || linked.ExpiresAt.Before(before) {
+		t.Fatalf("link expiry not copied: %+v", linked)
+	}
+	var listed listOutput
+	ok(t, call(t, s, "list_files", map[string]any{}), &listed)
+	for _, file := range listed.Files {
+		if file.ID == linked.ID && file.ExpiresAt == nil {
+			t.Fatal("list omitted expiry")
+		}
+	}
+	if !call(t, s, "create_upload_url", map[string]any{"file": id, "expires_at": deadline}).IsError {
+		t.Fatal("replacement expiry accepted")
+	}
+}

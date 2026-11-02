@@ -253,3 +253,25 @@ func TestAdminDisabledWithoutToken(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminIncludesPublicExpiry(t *testing.T) {
+	e := newEnv(t)
+	rec := e.api(http.MethodPost, "/api/files?name=public-expiry.txt&expires_at=2030-01-01T00:00:00Z", "expiry")
+	if rec.Code != 201 {
+		t.Fatalf("upload: %d %s", rec.Code, rec.Body)
+	}
+	for _, token := range []string{"", "wrong"} {
+		rec = adminGet(e, "/api/admin/files", token)
+		if rec.Code != 401 || strings.Contains(rec.Body.String(), "public-expiry") {
+			t.Fatalf("anonymous metadata: %d %s", rec.Code, rec.Body)
+		}
+	}
+	rec = adminGet(e, "/api/admin/files", adminToken)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"expires_at":"2030-01-01T00:00:00Z"`) || !strings.Contains(rec.Body.String(), "public-expiry.txt") {
+		t.Fatalf("admin expiry: %d %s", rec.Code, rec.Body)
+	}
+	rec = e.do(httptest.NewRequest(http.MethodGet, "/admin", nil))
+	if !strings.Contains(rec.Body.String(), "Protected and expiring files") || !strings.Contains(rec.Body.String(), "Expires") {
+		t.Fatalf("admin heading: %s", rec.Body)
+	}
+}

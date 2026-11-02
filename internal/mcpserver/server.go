@@ -49,7 +49,34 @@ type ContentInput struct {
 	ContentType   string `json:"content_type,omitempty" jsonschema:"MIME type. Optional: detected from the name and content when omitted."`
 }
 
+type ExpiryInput struct {
+	ExpiresAt     *string `json:"expires_at,omitempty" jsonschema:"File expiry as RFC 3339; mutually exclusive with expires_in_days. Null clears expiry in set_expiry."`
+	ExpiresInDays *int    `json:"expires_in_days,omitempty" jsonschema:"Positive whole days from when settings are accepted; mutually exclusive with expires_at."`
+}
+
+type SetExpiryInput struct {
+	File string `json:"file" jsonschema:"The file: its ID, its public URL, or namespace/name."`
+	ExpiryInput
+	expiryPresent bool
+}
+
+func (in *SetExpiryInput) UnmarshalJSON(data []byte) error {
+	type plain SetExpiryInput
+	var value plain
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*in = SetExpiryInput(value)
+	_, in.expiryPresent = fields["expires_at"]
+	return nil
+}
+
 type UploadInput struct {
+	ExpiryInput
 	Name          string   `json:"name,omitempty" jsonschema:"File name, which becomes the last part of the URL. May contain '/' to make folders. Defaults to the source_url's file name."`
 	Namespace     string   `json:"namespace,omitempty" jsonschema:"Existing namespace to add this file to (to group files, e.g. a small website): the namespace UUID or URL of an earlier upload. Omit to create a new unguessable namespace; you cannot choose a new one."`
 	Password      string   `json:"password,omitempty" jsonschema:"Optional password visitors must enter to open the file."`
@@ -103,7 +130,7 @@ type EmailsInput struct {
 
 type AccessLogInput struct {
 	File   string `json:"file,omitempty" jsonschema:"Only events for this file: its ID, public URL, or namespace/name. Omit for all files."`
-	Event  string `json:"event,omitempty" jsonschema:"Only this event: view, denied, wrong_password, unlock, sign_in or sign_in_failed."`
+	Event  string `json:"event,omitempty" jsonschema:"Only this event: view, denied, wrong_password, unlock, sign_in, sign_in_failed or expired."`
 	Search string `json:"search,omitempty" jsonschema:"Case-insensitive substring of the email, IP, user agent or file name."`
 	Before int64  `json:"before,omitempty" jsonschema:"Only events with an ID below this, for paging."`
 	Limit  int    `json:"limit,omitempty" jsonschema:"Max events (default 200, max 1000)."`
@@ -143,6 +170,7 @@ type PurgeInput struct {
 }
 
 type UploadURLInput struct {
+	ExpiryInput
 	Name            string   `json:"name,omitempty" jsonschema:"Name for the new file. Omit to use the uploaded file's own name."`
 	Namespace       string   `json:"namespace,omitempty" jsonschema:"Existing namespace for the new file: the namespace UUID or URL of an earlier upload. Omit for a new namespace; you cannot choose a new one."`
 	Password        string   `json:"password,omitempty" jsonschema:"Optional password visitors must enter to open the new file."`
@@ -247,6 +275,7 @@ func New(cfg Config) *mcp.Server {
 	add(srv, "delete_file", fmt.Sprintf("Delete a file. Its URL stops working immediately, but it can be restored with restore_file for %d days.", days), destructive, s.delete)
 	add(srv, "restore_file", "Restore a deleted file at its original URL.", additive, s.restore)
 	add(srv, "purge_file", "Permanently and immediately destroy a file and all its versions (for example something uploaded by mistake). Irreversible; requires confirm=true.", destructive, s.purge)
+	add(srv, "set_expiry", "Set recoverable file expiry using expires_at or expires_in_days. Pass expires_at=null to clear it. Restore clears a passed expiry and preserves a future expiry.", updating, s.setExpiry)
 	add(srv, "set_password", "Set or change the password visitors must enter to open a file. Old unlock cookies stop working.", updating, s.setPassword)
 	add(srv, "remove_password", "Remove a file's password so anyone with the link can open it.", updating, s.removePassword)
 	add(srv, "set_allowed_emails", "Set exactly who can open a file: visitors sign in with Hack Club Auth and must use one of these emails (or match an '@domain' entry). Replaces the whole list; an empty list removes the restriction. Takes effect immediately, including for people already signed in.", updating, s.setAllowedEmails)
@@ -309,6 +338,10 @@ func (s *server) content(ctx context.Context, in ContentInput) (body io.Reader, 
 }
 
 func (s *server) upload(ctx context.Context, in UploadInput) (files.File, error) {
+	expiry, err := s.files.ResolveExpiry(in.ExpiresAt, in.ExpiresInDays)
+	if err != nil {
+		return files.File{}, err
+	}
 	body, size, contentType, suggested, closer, err := s.content(ctx, in.ContentInput)
 	if err != nil {
 		return files.File{}, err
@@ -320,7 +353,7 @@ func (s *server) upload(ctx context.Context, in UploadInput) (files.File, error)
 	}
 	return s.files.Upload(ctx, files.UploadInput{
 		Namespace: in.Namespace, Name: name, ContentType: contentType, Body: body, Size: size,
-		Password: in.Password, AllowedEmails: in.AllowedEmails, Client: client(ctx),
+		Password: in.Password, AllowedEmails: in.AllowedEmails, Client: client(ctx), ExpiresAt: expiry,
 	})
 }
 
@@ -388,10 +421,14 @@ func isText(mediaType string) bool {
 }
 
 func (s *server) uploadURL(ctx context.Context, in UploadURLInput) (uploadURLOutput, error) {
+	expiry, err := s.files.ResolveExpiry(in.ExpiresAt, in.ExpiresInDays)
+	if err != nil {
+		return uploadURLOutput{}, err
+	}
 	ttl := time.Duration(clamp(in.ExpiresMinutes, 60, 1440)) * time.Minute
 	link := files.UploadLinkInput{
 		Namespace: in.Namespace, Name: in.Name, Password: in.Password, AllowedEmails: in.AllowedEmails,
-		Client: client(ctx), ExpiresAt: time.Now().Add(ttl), ExpectedVersion: in.ExpectedVersion,
+		Client: client(ctx), ExpiresAt: time.Now().Add(ttl), ExpectedVersion: in.ExpectedVersion, FileExpiresAt: expiry,
 	}
 	if in.File != "" {
 		f, err := s.files.Resolve(ctx, in.File)
@@ -612,4 +649,22 @@ func (s *server) purge(ctx context.Context, in PurgeInput) (okOutput, error) {
 func (s *server) stats(ctx context.Context, _ Empty) (statsOutput, error) {
 	st, err := s.files.Stats(ctx)
 	return statsOutput{Stats: st, RetentionDays: int(s.files.Retention().Hours() / 24), MaxUploadBytes: s.files.MaxBytes(), BaseURL: s.files.BaseURL()}, err
+}
+
+func (s *server) setExpiry(ctx context.Context, in SetExpiryInput) (files.File, error) {
+	if in.expiryPresent && in.ExpiresInDays != nil {
+		return files.File{}, fmt.Errorf("%w: expires_at and expires_in_days are mutually exclusive", files.ErrInvalid)
+	}
+	if !in.expiryPresent && in.ExpiresInDays == nil {
+		return files.File{}, fmt.Errorf("%w: supply expires_at or expires_in_days", files.ErrInvalid)
+	}
+	expiry, err := s.files.ResolveExpiry(in.ExpiresAt, in.ExpiresInDays)
+	if err != nil {
+		return files.File{}, err
+	}
+	f, err := s.files.Resolve(ctx, in.File)
+	if err != nil {
+		return files.File{}, err
+	}
+	return s.files.SetExpiry(ctx, f.ID, expiry)
 }

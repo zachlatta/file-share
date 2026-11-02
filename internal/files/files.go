@@ -93,6 +93,7 @@ type File struct {
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 	DeletedAt     *time.Time `json:"deleted_at,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 	// PurgeAt is when a deleted file will be permanently removed.
 	PurgeAt *time.Time `json:"purge_at,omitempty"`
 
@@ -190,6 +191,7 @@ func (s *Service) URLFor(namespace, name string) string {
 }
 
 type UploadInput struct {
+	ExpiresAt *time.Time
 	// Namespace is an existing namespace (its UUID or URL), or empty for a
 	// new one.
 	Namespace   string
@@ -273,8 +275,8 @@ func (s *Service) upload(ctx context.Context, in UploadInput, hash string) (File
 	now := s.nowUTC()
 	id := uuid.NewString()
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO files (id, namespace, name, password_hash, allowed_emails, current_version, created_at, updated_at)
-			VALUES ($1, $2, $3, NULLIF($4, ''), $5, 1, $6, $6)`, id, ns, name, hash, emails, now); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO files (id, namespace, name, password_hash, allowed_emails, current_version, created_at, updated_at, expires_at)
+			VALUES ($1, $2, $3, NULLIF($4, ''), $5, 1, $6, $6, $7)`, id, ns, name, hash, emails, now, in.ExpiresAt); err != nil {
 			return err
 		}
 		return insertVersion(ctx, tx, id, 1, v, now, in.Client, "")
@@ -453,7 +455,7 @@ func (s *Service) Delete(ctx context.Context, id string) (File, error) {
 
 // Restore undeletes a file at its original URL.
 func (s *Service) Restore(ctx context.Context, id string) (File, error) {
-	tag, err := s.db.Exec(ctx, `UPDATE files SET deleted_at = NULL, updated_at = $2 WHERE id = $1 AND deleted_at IS NOT NULL`, id, s.nowUTC())
+	tag, err := s.db.Exec(ctx, `UPDATE files SET deleted_at = NULL, expires_at = CASE WHEN expires_at <= $2 THEN NULL ELSE expires_at END, updated_at = $2 WHERE id = $1 AND deleted_at IS NOT NULL`, id, s.nowUTC())
 	if err != nil {
 		if isUniqueViolation(err) {
 			return File{}, fmt.Errorf("%w: rename or delete the other file first", ErrExists)
@@ -636,6 +638,14 @@ func (s *Service) Purge(ctx context.Context) (PurgeResult, error) {
 	cutoff := s.nowUTC().Add(-s.retention)
 	var keys []string
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `WITH expired AS (
+ UPDATE files SET deleted_at = $1, updated_at = $1
+ WHERE deleted_at IS NULL AND expires_at <= $1
+ RETURNING id, namespace, name, current_version
+ ) INSERT INTO access_events (at, file_id, namespace, name, version, event)
+ SELECT $1, id, namespace, name, current_version, 'expired' FROM expired`, s.nowUTC()); err != nil {
+			return err
+		}
 		rows, err := tx.Query(ctx, `
 			DELETE FROM versions v USING files f
 			WHERE v.file_id = f.id AND (
@@ -748,4 +758,40 @@ func (s *Service) purgeOrphans(ctx context.Context) (int, error) {
 		}
 	}
 	return deleted, errors.Join(errs...)
+}
+
+// ResolveExpiry validates file expiry options and resolves relative days at acceptance.
+func (s *Service) ResolveExpiry(at *string, days *int) (*time.Time, error) {
+	if at != nil && days != nil {
+		return nil, fmt.Errorf("%w: expires_at and expires_in_days are mutually exclusive", ErrInvalid)
+	}
+	var t time.Time
+	if at != nil {
+		var err error
+		t, err = time.Parse(time.RFC3339, *at)
+		if err != nil {
+			return nil, fmt.Errorf("%w: expires_at must be RFC 3339", ErrInvalid)
+		}
+	} else if days != nil {
+		if *days <= 0 || int64(*days) > int64((1<<63-1)/int64(24*time.Hour)) {
+			return nil, fmt.Errorf("%w: expires_in_days must be positive whole days within range", ErrInvalid)
+		}
+		t = s.nowUTC().Add(time.Duration(*days) * 24 * time.Hour)
+	} else {
+		return nil, nil
+	}
+	t = t.UTC().Truncate(time.Microsecond)
+	return &t, nil
+}
+
+// SetExpiry sets or clears a file's expiry without changing its bytes.
+func (s *Service) SetExpiry(ctx context.Context, id string, at *time.Time) (File, error) {
+	tag, err := s.db.Exec(ctx, `UPDATE files SET expires_at = $2, updated_at = $3 WHERE id = $1`, id, at, s.nowUTC())
+	if err != nil {
+		return File{}, notFound(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return File{}, ErrNotFound
+	}
+	return s.Get(ctx, id)
 }

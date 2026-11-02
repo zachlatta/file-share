@@ -107,6 +107,9 @@ var migrations = []string{
 	// not abort multi-gigabyte joins; result_file_id lets retries return the
 	// finished file.
 	`ALTER TABLE upload_links ADD COLUMN result_file_id uuid REFERENCES files (id) ON DELETE SET NULL;`,
+	`ALTER TABLE files ADD COLUMN expires_at timestamptz;
+ ALTER TABLE upload_links ADD COLUMN file_expires_at timestamptz;
+ CREATE INDEX files_expires ON files (expires_at) WHERE deleted_at IS NULL AND expires_at IS NOT NULL;`,
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {

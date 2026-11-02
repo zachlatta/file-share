@@ -18,6 +18,15 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
 - **Recoverable deletes.** Deleted files and replaced versions are kept for `RETENTION_DAYS`
   (default 30), during which `restore_file` / `rollback_file` bring them back. An hourly job
   then purges them. `purge_file` destroys a file immediately, for things uploaded by mistake.
+- **Recoverable expiry.** Set `expires_at` (RFC 3339) or `expires_in_days` (positive whole
+  days) on `upload_file`, `create_upload_url`, or POST `/api/files`. These options are
+  mutually exclusive; days are resolved when settings are accepted, including when a link
+  is created. The hourly purge soft-deletes due files and records an `expired` audit event,
+  even for public files. The normal retention window starts at soft deletion. Restoring
+  clears a passed expiry and preserves a future one. Use `set_expiry` or PATCH `/api/files/<id>`
+  to change expiry; `expires_at: null` clears it, while PATCH omission preserves it. Replacement
+  uploads preserve expiry; replacement links reject expiry options, so update it separately.
+  Get/list metadata and the authenticated admin file table show `expires_at`.
 - **Share with specific people.** Restrict a file to email addresses (or `@domain.com` for a
   whole domain). Visitors click **Sign in with Hack Club**, log in with
   [Hack Club Auth](https://auth.hackclub.com), and only a verified email on the list opens the
@@ -34,7 +43,7 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
   recorded: views (and how access was granted), visitors turned away at the gate, wrong
   passwords, and Hack Club sign-ins, with IP, country, user agent, referrer (query string
   removed) and the signed-in email. Signed download URLs for protected files are logged too.
-  Public files are not logged. Browse it at `/admin` after signing in with `ADMIN_TOKEN`, or
+  Public views are not logged; automatic expiry is logged for every file. Browse it at `/admin` after signing in with `ADMIN_TOKEN`, or
   ask an agent through `get_access_log`. The log outlives purged files.
 - **Upload links, no secret.** `create_upload_url` returns a one-off signed URL, so an MCP
   client can upload a local or large file with plain `curl` and never holds `MCP_SECRET` or
@@ -60,7 +69,7 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
 | Upload | `upload_file` (text, base64 or `source_url`), `create_upload_url`, `replace_file` |
 | Read | `read_file`, `create_download_url`, `get_file`, `list_files`, `list_versions`, `get_access_log`, `get_request_log`, `get_listening`, `get_stats` |
 | History | `rollback_file`, `delete_file`, `restore_file`, `purge_file` |
-| Manage | `rename_file`, `set_allowed_emails`, `set_password`, `remove_password` |
+| Manage | `rename_file`, `set_expiry`, `set_allowed_emails`, `set_password`, `remove_password` |
 
 Tools accept a file by ID, public URL, or `namespace/name`.
 
@@ -106,12 +115,16 @@ curl -H "$AUTH" -X PUT --data-binary @v2.jpg https://files.zachlatta.com/api/fil
 curl -H "$AUTH" -X PUT --data-binary @v2.jpg "https://files.zachlatta.com/api/files/<id>/content?expected_version=1"  # replace only if still v1, else 409
 curl -H "$AUTH" -o out.jpg "https://files.zachlatta.com/api/files/<id>/content?version=1"  # exact bytes, even restricted or deleted
 curl -H "$AUTH" -X PATCH -d '{"allowed_emails":["max@hackclub.com"],"password":""}' https://files.zachlatta.com/api/files/<id>  # who can open it; "" removes the password, [] makes it public; also "name"
+curl -H "$AUTH" -X PATCH -d '{"expires_in_days":30}' https://files.zachlatta.com/api/files/<id>  # expire in 30 days; {"expires_at":null} clears
 curl -H "$AUTH" https://files.zachlatta.com/api/files/<id>/versions                    # history
 curl -H "$AUTH" -X POST "https://files.zachlatta.com/api/files/<id>/rollback?version=1"  # roll back
 curl -H "$AUTH" "https://files.zachlatta.com/api/files?q=photo&deleted=false"         # list
 curl -H "$AUTH" -X DELETE https://files.zachlatta.com/api/files/<id>                  # delete
 curl -H "$AUTH" -X POST https://files.zachlatta.com/api/files/<id>/restore            # restore
 ```
+
+POST expiry options are query parameters for raw bytes or multipart form fields. PATCH accepts
+them as JSON fields. Expiry may be in the past; deletion happens on the next purge.
 
 `<id>` may also be the URL-escaped `namespace%2Fname`. Any MCP tool works from a shell with the
 same bearer, as a single stateless JSON-RPC call:

@@ -337,6 +337,7 @@ type upload struct {
 	emails                                 []string
 	body                                   io.Reader
 	size                                   int64
+	expiresAt, expiresDays                 *string
 }
 
 // splitEmails reads a comma- or space-separated list of emails.
@@ -350,6 +351,14 @@ func splitEmails(value string) []string {
 func (h *Handler) readUpload(r *http.Request, fn func(upload) (files.File, error)) (files.File, error) {
 	q := r.URL.Query()
 	u := upload{name: q.Get("name"), namespace: q.Get("namespace"), password: q.Get("password"), emails: splitEmails(q.Get("emails"))}
+	if q.Has("expires_at") {
+		v := q.Get("expires_at")
+		u.expiresAt = &v
+	}
+	if q.Has("expires_in_days") {
+		v := q.Get("expires_in_days")
+		u.expiresDays = &v
+	}
 	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if mediaType != "multipart/form-data" {
 		u.contentType = r.Header.Get("Content-Type")
@@ -422,6 +431,12 @@ func (h *Handler) readUpload(r *http.Request, fn func(upload) (files.File, error
 			u.password = string(value)
 		case "emails":
 			u.emails = splitEmails(string(value))
+		case "expires_at":
+			v := string(value)
+			u.expiresAt = &v
+		case "expires_in_days":
+			v := string(value)
+			u.expiresDays = &v
 		}
 	}
 	if spool == nil {
@@ -442,11 +457,27 @@ func (h *Handler) create(r *http.Request, client, namespace, name string) (files
 		if namespace != "" {
 			u.namespace = namespace
 		}
+		expiry, err := h.uploadExpiry(u)
+		if err != nil {
+			return files.File{}, err
+		}
 		return h.files.Upload(r.Context(), files.UploadInput{
 			Namespace: u.namespace, Name: u.name, ContentType: u.contentType,
-			Body: u.body, Size: u.size, Password: u.password, AllowedEmails: u.emails, Client: client,
+			Body: u.body, Size: u.size, Password: u.password, AllowedEmails: u.emails, Client: client, ExpiresAt: expiry,
 		})
 	})
+}
+
+func (h *Handler) uploadExpiry(u upload) (*time.Time, error) {
+	var days *int
+	if u.expiresDays != nil {
+		n, err := strconv.Atoi(*u.expiresDays)
+		if err != nil {
+			return nil, fmt.Errorf("%w: expires_in_days must be a positive whole number", files.ErrInvalid)
+		}
+		days = &n
+	}
+	return h.files.ResolveExpiry(u.expiresAt, days)
 }
 
 func (h *Handler) replace(r *http.Request, client, id string, expected int) (files.File, error) {
@@ -545,9 +576,11 @@ func (h *Handler) apiRollback(w http.ResponseWriter, r *http.Request) {
 // password removes the password; an empty allowed_emails list removes the
 // email restriction.
 type fileUpdate struct {
-	Name          *string   `json:"name"`
-	Password      *string   `json:"password"`
-	AllowedEmails *[]string `json:"allowed_emails"`
+	Name          *string         `json:"name"`
+	Password      *string         `json:"password"`
+	AllowedEmails *[]string       `json:"allowed_emails"`
+	ExpiresAt     json.RawMessage `json:"expires_at"`
+	ExpiresInDays *int            `json:"expires_in_days"`
 }
 
 func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request) {
@@ -555,14 +588,39 @@ func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil {
-		respond(w, 0, nil, fmt.Errorf("%w: body must be JSON with name, password and/or allowed_emails: %v", files.ErrInvalid, err))
+		respond(w, 0, nil, fmt.Errorf("%w: body must be JSON with name, password, allowed_emails and/or expiry: %v", files.ErrInvalid, err))
 		return
 	}
-	if in.Name == nil && in.Password == nil && in.AllowedEmails == nil {
-		respond(w, 0, nil, fmt.Errorf("%w: set at least one of name, password or allowed_emails", files.ErrInvalid))
+	if in.Name == nil && in.Password == nil && in.AllowedEmails == nil && in.ExpiresAt == nil && in.ExpiresInDays == nil {
+		respond(w, 0, nil, fmt.Errorf("%w: set at least one of name, password, allowed_emails or expiry", files.ErrInvalid))
 		return
+	}
+	var expiry *time.Time
+	if in.ExpiresAt != nil || in.ExpiresInDays != nil {
+		var at *string
+		if string(in.ExpiresAt) != "null" && in.ExpiresAt != nil {
+			var value string
+			if err := json.Unmarshal(in.ExpiresAt, &value); err != nil {
+				respond(w, 0, nil, fmt.Errorf("%w: expires_at must be RFC 3339 or null", files.ErrInvalid))
+				return
+			}
+			at = &value
+		}
+		if in.ExpiresAt != nil && in.ExpiresInDays != nil {
+			respond(w, 0, nil, fmt.Errorf("%w: use expires_at or expires_in_days", files.ErrInvalid))
+			return
+		}
+		var err error
+		expiry, err = h.files.ResolveExpiry(at, in.ExpiresInDays)
+		if err != nil {
+			respond(w, 0, nil, err)
+			return
+		}
 	}
 	f, err := h.apiFile(r)
+	if err == nil && (in.ExpiresAt != nil || in.ExpiresInDays != nil) {
+		f, err = h.files.SetExpiry(r.Context(), f.ID, expiry)
+	}
 	if err == nil && in.AllowedEmails != nil {
 		f, err = h.files.SetAllowedEmails(r.Context(), f.ID, *in.AllowedEmails)
 	}

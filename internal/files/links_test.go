@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -406,6 +407,44 @@ func TestChunkedCompletionCachesBackgroundErrorAndDeduplicatesConcurrentPolls(t 
 	for i := range 5 {
 		if errs[i] != nil || files[i].ID != files[0].ID {
 			t.Fatalf("caller %d: %+v %v", i, files[i], errs[i])
+		}
+	}
+}
+
+func TestLinkFileExpiry(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	expiry := h.clock.t.Add(48 * time.Hour)
+	for _, chunked := range []bool{false, true} {
+		link, err := h.svc.CreateUploadLink(ctx, UploadLinkInput{Name: fmt.Sprintf("expiry-%t.txt", chunked), ExpiresAt: h.clock.t.Add(time.Hour), FileExpiresAt: &expiry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f File
+		if chunked {
+			key := "0123456789abcdef0123456789abcdef"
+			if _, err := h.svc.PutPart(ctx, key, 1, strings.NewReader("data"), 4); err != nil {
+				t.Fatal(err)
+			}
+			f, err = h.svc.CompleteParts(ctx, key, 1, func(bg context.Context, r io.Reader) (File, error) {
+				return h.svc.UploadWithLink(bg, link.ID, LinkUpload{Body: r, Size: -1})
+			})
+		} else {
+			f, err = h.svc.UploadWithLink(ctx, link.ID, LinkUpload{Body: strings.NewReader("data"), Size: -1})
+		}
+		if err != nil || f.ExpiresAt == nil || !f.ExpiresAt.Equal(expiry) {
+			t.Fatalf("file: %+v %v", f, err)
+		}
+		if _, err := h.svc.CreateUploadLink(ctx, UploadLinkInput{FileID: f.ID, ExpiresAt: h.clock.t.Add(time.Hour), FileExpiresAt: &expiry}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("replace expiry: %v", err)
+		}
+		replacement, err := h.svc.CreateUploadLink(ctx, UploadLinkInput{FileID: f.ID, ExpiresAt: h.clock.t.Add(time.Hour)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err = h.svc.UploadWithLink(ctx, replacement.ID, LinkUpload{Body: strings.NewReader("new"), Size: -1})
+		if err != nil || f.ExpiresAt == nil || !f.ExpiresAt.Equal(expiry) {
+			t.Fatalf("replace: %+v %v", f, err)
 		}
 	}
 }
