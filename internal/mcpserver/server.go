@@ -217,7 +217,7 @@ type okOutput struct {
 
 type uploadURLOutput struct {
 	UploadURL string `json:"upload_url"`
-	// SingleUse: the URL stops working after one successful upload.
+	// SingleUse: the URL accepts one file; status remains available after completion.
 	SingleUse bool      `json:"single_use"`
 	ExpiresAt time.Time `json:"expires_at"`
 	// URL is the file's public URL once uploaded, when the name is known.
@@ -263,7 +263,7 @@ func New(cfg Config) *mcp.Server {
 	destructive := &mcp.ToolAnnotations{DestructiveHint: ptr(true), OpenWorldHint: &closed}
 
 	add(srv, "upload_file", "Upload a new file and get its public URL. Give exactly one of content_text, content_base64 or source_url. Omit namespace for a fresh unguessable URL; pass a namespace to group files. Optionally restrict it to allowed_emails (sign in with Hack Club) or a password.", fetching, s.upload)
-	add(srv, "create_upload_url", "Get a single-use URL that accepts one file over HTTP, so a local or large file can be uploaded with curl and no secret. Set name, namespace, password and allowed_emails here; the upload only sends the bytes. Files up to 20 MB: run the returned curl (multipart; omit name to use the local file's name). Larger files: run curl_chunked, which PUTs 20 MB parts with ?part=N and then polls POST ?complete=N until assembly finishes (202 while assembling, 201/200 when done). Pass local_path to get commands that run as is. The URL stops working after one successful upload. Pass file to upload a new version of an existing file instead.", additive, s.uploadURL)
+	add(srv, "create_upload_url", "Get a single-use URL that accepts one file over HTTP, so a local or large file can be uploaded with curl and no secret. Set name, namespace, password and allowed_emails here; the upload only sends the bytes. Files up to 20 MB: run the returned curl (multipart; omit name to use the local file's name). Larger files: run curl_chunked, which PUTs 20 MB parts with ?part=N and then polls POST ?complete=N until assembly finishes (202 while assembling, 201/200 when done). Pass local_path to get commands that run as is. The URL accepts one file. Its expiry is a deadline to start; stored parts keep it valid until 24 hours after the latest part. GET <upload_url>?status reports stored parts, the state (pending, assembling, or done), and the completed file, and remains available after completion until cleanup (after the start deadline and at least 24 hours after completion was claimed). Rerunning curl_chunked resumes by skipping stored parts with matching sizes and sending only the rest. Use the same local file when resuming. Pass file to upload a new version of an existing file instead.", additive, s.uploadURL)
 	add(srv, "replace_file", "Replace a file's content, keeping its URL and password. The previous content stays available as an older version for the retention window. Give exactly one of content_text, content_base64 or source_url.", fetching, s.replace)
 	mcp.AddTool(srv, &mcp.Tool{Name: "read_file", Description: "Read a file's content (current or an older version). Text comes back as text, other files as base64; images are also returned as images.", Annotations: readOnly}, s.read)
 	add(srv, "create_download_url", "Get a short-lived private URL for the exact bytes of a version of a file. It works even for restricted (password or email) or deleted files.", readOnly, s.downloadURL)

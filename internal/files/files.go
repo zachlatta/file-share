@@ -681,7 +681,7 @@ func (s *Service) Purge(ctx context.Context) (PurgeResult, error) {
 			if err != nil {
 				return err
 			}
-			if active || s.hasCompleting(linkPartKey(id)) {
+			if active || s.hasCompleting(LinkPartKey(id)) {
 				continue
 			}
 			tag, err := tx.Exec(ctx, `DELETE FROM upload_links WHERE id = $1`, id)

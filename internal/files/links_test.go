@@ -2,8 +2,6 @@ package files
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -147,11 +145,6 @@ func TestReplaceLinkWithExpectedVersion(t *testing.T) {
 	}
 }
 
-func linkUploadKey(linkID string) string {
-	sum := sha256.Sum256([]byte(linkID))
-	return hex.EncodeToString(sum[:16])
-}
-
 type blockingReader struct {
 	started chan struct{}
 	gate    <-chan struct{}
@@ -182,7 +175,7 @@ func TestChunkedLinkCompletionSpansRequestWindowsAndSurvivesCancel(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := linkUploadKey(link.ID)
+	key := LinkPartKey(link.ID)
 	for i, part := range []string{"part-one-", "part-two"} {
 		if _, err := h.svc.PutPart(ctx, key, i+1, strings.NewReader(part), -1); err != nil {
 			t.Fatal(err)
@@ -252,7 +245,7 @@ func TestChunkedLinkCompletionStaleClaimAndRestartRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := linkUploadKey(link.ID)
+	key := LinkPartKey(link.ID)
 	for i, part := range []string{"hello-", "world"} {
 		if _, err := h.svc.PutPart(ctx, key, i+1, strings.NewReader(part), -1); err != nil {
 			t.Fatal(err)
@@ -454,8 +447,7 @@ func TestUploadDeadlineIsStartDeadline(t *testing.T) {
 	ctx := context.Background()
 	active, _ := h.svc.CreateUploadLink(ctx, UploadLinkInput{Name: "active.bin", ExpiresAt: h.clock.t.Add(time.Hour)})
 	untouched, _ := h.svc.CreateUploadLink(ctx, UploadLinkInput{Name: "untouched.bin", ExpiresAt: h.clock.t.Add(time.Hour)})
-	sum := sha256.Sum256([]byte(active.ID))
-	key := hex.EncodeToString(sum[:16])
+	key := LinkPartKey(active.ID)
 	if _, err := h.svc.PutPart(ctx, key, 1, strings.NewReader("a"), 1); err != nil {
 		t.Fatal(err)
 	}
@@ -497,8 +489,7 @@ func TestUploadDeadlineIsStartDeadline(t *testing.T) {
 		t.Fatalf("completed status retained too long: %v", err)
 	}
 	stale, _ := h.svc.CreateUploadLink(ctx, UploadLinkInput{Name: "stale", ExpiresAt: h.clock.t.Add(time.Minute)})
-	sum = sha256.Sum256([]byte(stale.ID))
-	key = hex.EncodeToString(sum[:16])
+	key = LinkPartKey(stale.ID)
 	h.svc.PutPart(ctx, key, 1, strings.NewReader("a"), 1)
 	h.clock.t = h.clock.t.Add(partTTL)
 	if _, err := h.svc.UploadLink(ctx, stale.ID); !errors.Is(err, ErrNotFound) {

@@ -261,14 +261,14 @@ func (s *Service) UploadWithLink(ctx context.Context, id string, in LinkUpload) 
 	return f, nil
 }
 
-// Link activity is derived from successfully stored parts, never request arrival.
-func linkPartKey(id string) string {
+// LinkPartKey returns the parts folder name for an upload link.
+func LinkPartKey(id string) string {
 	sum := sha256.Sum256([]byte(id))
 	return hex.EncodeToString(sum[:16])
 }
 
 func (s *Service) activeParts(ctx context.Context, id string) (bool, error) {
-	objects, err := s.blobs.List(ctx, "uploads/"+linkPartKey(id)+"/")
+	objects, err := s.blobs.List(ctx, "uploads/"+LinkPartKey(id)+"/")
 	if err != nil {
 		return false, err
 	}
@@ -292,7 +292,7 @@ type UploadStatus struct {
 
 // UploadLinkStatus is non-consuming and requires the same grant as completion.
 func (s *Service) UploadLinkStatus(ctx context.Context, id string) (UploadStatus, error) {
-	key := linkPartKey(id)
+	key := LinkPartKey(id)
 	_, f, err := s.UploadLinkForComplete(ctx, id, key)
 	if errors.Is(err, ErrLinkUsed) { // another instance may hold the assembly claim
 		return UploadStatus{Parts: []UploadPart{}, State: "assembling"}, nil

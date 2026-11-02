@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -603,8 +602,7 @@ func TestChunkedSignedUploadPolls202UntilComplete(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Simulate a killed run with part 1 acknowledged before restarting.
-		sum := sha256.Sum256([]byte(secondLink.ID))
-		key := hex.EncodeToString(sum[:16])
+		key := files.LinkPartKey(secondLink.ID)
 		if _, err := svc2.PutPart(context.Background(), key, 1, bytes.NewReader(wantBody[:4096]), 4096); err != nil {
 			t.Fatal(err)
 		}

@@ -6,8 +6,6 @@ package web
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -685,8 +683,7 @@ func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	// Chunked mode, for bodies larger than a proxy allows in one request:
 	// PUT ?part=1..N, then POST ?complete=N.
-	sum := sha256.Sum256([]byte(linkID))
-	uploadKey := hex.EncodeToString(sum[:16])
+	uploadKey := files.LinkPartKey(linkID)
 	if q.Has("complete") {
 		parts, err := strconv.Atoi(q.Get("complete"))
 		if err != nil {
