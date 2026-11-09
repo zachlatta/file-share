@@ -80,6 +80,10 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
 
 Tools accept a file by ID, public URL, or `namespace/name`.
 
+`upload_file` and `replace_file` take exactly one content source. An empty `content_text` or
+`content_base64` is a source: it makes an empty file (such as a `.nojekyll` placeholder) or blanks
+an existing one. An empty request body does the same on the HTTP API.
+
 ## Authentication
 
 This is the same design as the personal data warehouse:

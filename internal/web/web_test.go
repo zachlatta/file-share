@@ -279,6 +279,35 @@ func TestAPIUploadReplaceDelete(t *testing.T) {
 	}
 }
 
+// Empty files (a .nojekyll placeholder, a blanked file) work over HTTP too.
+func TestAPIEmptyFiles(t *testing.T) {
+	e := newEnv(t)
+	rec := e.api(http.MethodPost, "/api/files?name=.nojekyll", "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("empty raw upload: %d %s", rec.Code, rec.Body)
+	}
+	f := decodeFile(t, rec)
+	if f.Size != 0 {
+		t.Fatalf("empty raw upload = %+v", f)
+	}
+	body, ct := multipartBody(t, "empty.txt", "", map[string]string{"namespace": f.Namespace})
+	req := httptest.NewRequest(http.MethodPost, "/api/files", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("Authorization", "Bearer curl:"+secret)
+	if rec := e.do(req); rec.Code != http.StatusCreated || decodeFile(t, rec).Size != 0 {
+		t.Fatalf("empty multipart upload: %d %s", rec.Code, rec.Body)
+	}
+	g := e.uploadFor(t, "page.html", "<p>v1</p>", "")
+	if rec := e.api(http.MethodPut, "/api/files/"+g.ID+"/content", ""); rec.Code != 200 || decodeFile(t, rec).Version != 2 || decodeFile(t, rec).Size != 0 {
+		t.Fatalf("blank replace: %d %s", rec.Code, rec.Body)
+	}
+	for _, target := range []string{"/" + f.Namespace + "/.nojekyll", "/api/files/" + g.ID + "/content"} {
+		if rec := e.api(http.MethodGet, target, ""); rec.Code != 200 || rec.Body.Len() != 0 {
+			t.Fatalf("GET %s: %d %q", target, rec.Code, rec.Body)
+		}
+	}
+}
+
 func TestAPIMultipartFieldsAfterFile(t *testing.T) {
 	e := newEnv(t)
 	// curl -F file=@x -F password=pw sends the password after the file part.

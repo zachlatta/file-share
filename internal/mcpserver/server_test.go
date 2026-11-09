@@ -166,6 +166,56 @@ func TestUploadReadReplaceRollback(t *testing.T) {
 	}
 }
 
+// An explicit empty content_text or content_base64 is a source: it makes an
+// empty file (such as a .nojekyll placeholder) or blanks an existing one.
+func TestEmptyContent(t *testing.T) {
+	s := connect(t)
+	var f files.File
+	ok(t, call(t, s, "upload_file", map[string]any{"name": ".nojekyll", "content_text": ""}), &f)
+	if f.Size != 0 || f.Version != 1 || f.SHA256 != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+		t.Fatalf("empty text upload = %+v", f)
+	}
+	var g files.File
+	ok(t, call(t, s, "upload_file", map[string]any{"name": "empty.bin", "namespace": f.Namespace, "content_base64": ""}), &g)
+	if g.Size != 0 || g.Namespace != f.Namespace {
+		t.Fatalf("empty base64 upload = %+v", g)
+	}
+	var read readOutput
+	ok(t, call(t, s, "read_file", map[string]any{"file": f.ID}), &read)
+	if read.Text != "" || read.Base64 != "" || read.Size != 0 {
+		t.Fatalf("read empty = %+v", read)
+	}
+
+	var h files.File
+	ok(t, call(t, s, "upload_file", map[string]any{"name": "notes.md", "content_text": "# v1"}), &h)
+	ok(t, call(t, s, "replace_file", map[string]any{"file": h.ID, "content_text": ""}), &h)
+	if h.Version != 2 || h.Size != 0 {
+		t.Fatalf("blank replace = %+v", h)
+	}
+	ok(t, call(t, s, "read_file", map[string]any{"file": h.ID, "version": 1}), &read)
+	if read.Text != "# v1" {
+		t.Fatalf("old version after blanking = %+v", read)
+	}
+	ok(t, call(t, s, "replace_file", map[string]any{"file": h.ID, "content_base64": ""}), &h)
+	if h.Version != 3 || h.Size != 0 {
+		t.Fatalf("blank base64 replace = %+v", h)
+	}
+
+	// Empty still counts toward "exactly one"; null and omitted do not.
+	for _, args := range []map[string]any{
+		{"name": "x.txt", "content_text": "", "content_base64": ""},
+		{"name": "x.txt", "content_text": "", "source_url": "https://example.com/x.txt"},
+		{"name": "x.txt", "content_text": nil},
+	} {
+		if res := call(t, s, "upload_file", args); !res.IsError || !strings.Contains(text(res), "exactly one") {
+			t.Errorf("upload %v: %s", args, text(res))
+		}
+	}
+	if res := call(t, s, "replace_file", map[string]any{"file": h.ID}); !res.IsError || !strings.Contains(text(res), "exactly one") {
+		t.Errorf("replace without content: %s", text(res))
+	}
+}
+
 func TestDeleteRestorePurgeAndPasswords(t *testing.T) {
 	s := connect(t)
 	var f files.File

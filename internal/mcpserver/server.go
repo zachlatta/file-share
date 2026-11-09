@@ -43,10 +43,12 @@ type server struct {
 const fileRef = "The file: its ID, its public URL, or \"namespace/name\". Deleted files can only be referenced by ID."
 
 type ContentInput struct {
-	ContentText   string `json:"content_text,omitempty" jsonschema:"File content as UTF-8 text. Use for text files."`
-	ContentBase64 string `json:"content_base64,omitempty" jsonschema:"File content, base64-encoded. Use for binary files that fit in a message; for large files use create_upload_url instead."`
-	SourceURL     string `json:"source_url,omitempty" jsonschema:"A public http(s) URL for the server to download the content from."`
-	ContentType   string `json:"content_type,omitempty" jsonschema:"MIME type. Optional: detected from the name and content when omitted."`
+	// ContentText and ContentBase64 are pointers so that an explicit empty
+	// string (an empty file) is a source, distinct from an omitted field.
+	ContentText   *string `json:"content_text,omitempty" jsonschema:"File content as UTF-8 text. Use for text files. An empty string makes an empty file."`
+	ContentBase64 *string `json:"content_base64,omitempty" jsonschema:"File content, base64-encoded. Use for binary files that fit in a message; for large files use create_upload_url instead."`
+	SourceURL     string  `json:"source_url,omitempty" jsonschema:"A public http(s) URL for the server to download the content from."`
+	ContentType   string  `json:"content_type,omitempty" jsonschema:"MIME type. Optional: detected from the name and content when omitted."`
 }
 
 type ExpiryInput struct {
@@ -306,7 +308,7 @@ func client(ctx context.Context) string {
 // content opens the single content source in in.
 func (s *server) content(ctx context.Context, in ContentInput) (body io.Reader, size int64, contentType, suggestedName string, closer func(), err error) {
 	sources := 0
-	for _, set := range []bool{in.ContentText != "", in.ContentBase64 != "", in.SourceURL != ""} {
+	for _, set := range []bool{in.ContentText != nil, in.ContentBase64 != nil, in.SourceURL != ""} {
 		if set {
 			sources++
 		}
@@ -316,10 +318,10 @@ func (s *server) content(ctx context.Context, in ContentInput) (body io.Reader, 
 	}
 	closer = func() {}
 	switch {
-	case in.ContentText != "":
-		return strings.NewReader(in.ContentText), int64(len(in.ContentText)), in.ContentType, "", closer, nil
-	case in.ContentBase64 != "":
-		data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(in.ContentBase64))
+	case in.ContentText != nil:
+		return strings.NewReader(*in.ContentText), int64(len(*in.ContentText)), in.ContentType, "", closer, nil
+	case in.ContentBase64 != nil:
+		data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(*in.ContentBase64))
 		if err != nil {
 			return nil, 0, "", "", nil, fmt.Errorf("%w: content_base64 is not valid base64: %v", files.ErrInvalid, err)
 		}

@@ -5,6 +5,7 @@
 package blob
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -152,6 +153,18 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64, conte
 	// Unsigned payloads avoid aws-chunked streaming signatures, which some
 	// S3-compatible servers (and test fakes) handle poorly over plain HTTP.
 	opts := minio.PutObjectOptions{ContentType: contentType, DisableContentSha256: true}
+	if size < 0 {
+		// An empty stream of unknown length would go out as a part with no
+		// Content-Length, which Garage ("Empty body") and gofakes3 refuse; store
+		// it as a known empty object.
+		buffered := bufio.NewReader(r)
+		if _, err := buffered.Peek(1); errors.Is(err, io.EOF) {
+			size = 0
+		} else if err != nil {
+			return err
+		}
+		r = buffered
+	}
 	if size < 0 {
 		opts.PartSize = 16 << 20
 	}

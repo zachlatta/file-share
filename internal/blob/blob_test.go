@@ -65,6 +65,24 @@ func TestStoreContract(t *testing.T) {
 			if err := store.Put(ctx, prefix+"b", strings.NewReader("streamed"), -1, "application/octet-stream"); err != nil {
 				t.Fatalf("put unknown size: %v", err)
 			}
+			// Empty objects store and read back, at known and unknown size.
+			for key, size := range map[string]int64{"empty": 0, "empty-streamed": -1} {
+				if err := store.Put(ctx, prefix+key, strings.NewReader(""), size, "text/plain"); err != nil {
+					t.Fatalf("put %s: %v", key, err)
+				}
+				obj, err := store.Get(ctx, prefix+key)
+				if err != nil {
+					t.Fatalf("get %s: %v", key, err)
+				}
+				data, err := io.ReadAll(obj)
+				_ = obj.Close()
+				if err != nil || len(data) != 0 {
+					t.Fatalf("read %s = %q, %v", key, data, err)
+				}
+				if err := store.Delete(ctx, prefix+key); err != nil {
+					t.Fatalf("delete %s: %v", key, err)
+				}
+			}
 			obj, err := store.Get(ctx, prefix+"a")
 			if err != nil {
 				t.Fatalf("get: %v", err)
