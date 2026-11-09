@@ -46,7 +46,7 @@ type ContentInput struct {
 	// ContentText and ContentBase64 are pointers so that an explicit empty
 	// string (an empty file) is a source, distinct from an omitted field.
 	ContentText   *string `json:"content_text,omitempty" jsonschema:"File content as UTF-8 text. Use for text files. An empty string makes an empty file."`
-	ContentBase64 *string `json:"content_base64,omitempty" jsonschema:"File content, base64-encoded. Use for binary files that fit in a message; for large files use create_upload_url instead."`
+	ContentBase64 *string `json:"content_base64,omitempty" jsonschema:"File content, base64-encoded. Use for binary files that fit in a message; for large files use create_upload_url instead. An empty string makes an empty file."`
 	SourceURL     string  `json:"source_url,omitempty" jsonschema:"A public http(s) URL for the server to download the content from."`
 	ContentType   string  `json:"content_type,omitempty" jsonschema:"MIME type. Optional: detected from the name and content when omitted."`
 }
