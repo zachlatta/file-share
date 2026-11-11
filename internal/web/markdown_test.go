@@ -1,0 +1,255 @@
+package web
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/zachlatta/file-share/internal/files"
+)
+
+const sampleMarkdown = "# Trip notes\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- [x] packed\n- [ ] booked\n\n" +
+	"```go\nfmt.Println(\"<hi>\")\n```\n\n![map](map.png)\n\n[docs](other.md) [bad](javascript:alert(1)) [web](https://example.com)\n\n" +
+	"<script>alert('x')</script>\n\n<img src=x onerror=alert(1)>\n"
+
+// browser is a top-level navigation the way Chrome, Firefox and Safari send it.
+func browser(target string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	return req
+}
+
+func (e *env) uploadTyped(t *testing.T, name, contentType, body string) files.File {
+	t.Helper()
+	f, err := e.files.Upload(context.Background(), files.UploadInput{Name: name, ContentType: contentType, Body: strings.NewReader(body), Size: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func TestMarkdownRawForNonBrowsers(t *testing.T) {
+	e := newEnv(t)
+	f := e.upload(t, "notes.md", sampleMarkdown, "")
+	cases := map[string]func(*http.Request){
+		"curl":  func(r *http.Request) { r.Header.Set("Accept", "*/*"); r.Header.Set("User-Agent", "curl/8.5.0") },
+		"bare":  func(*http.Request) {},
+		"wget":  func(r *http.Request) { r.Header.Set("Accept", "*/*"); r.Header.Set("User-Agent", "Wget/1.21") },
+		"fetch": func(r *http.Request) { r.Header.Set("Accept", "*/*"); r.Header.Set("Sec-Fetch-Dest", "empty") },
+		// A browser asking for the file from a script or iframe gets the
+		// file, not a page.
+		"iframe": func(r *http.Request) { r.Header.Set("Accept", "text/html"); r.Header.Set("Sec-Fetch-Dest", "iframe") },
+		"markdown-accept": func(r *http.Request) {
+			r.Header.Set("Accept", "text/markdown, text/plain;q=0.9, */*;q=0.1")
+		},
+	}
+	for name, set := range cases {
+		req := httptest.NewRequest(http.MethodGet, urlPath(f), nil)
+		set(req)
+		rec := e.do(req)
+		if rec.Code != 200 || rec.Body.String() != sampleMarkdown {
+			t.Fatalf("%s: %d %q", name, rec.Code, rec.Body)
+		}
+		h := rec.Header()
+		if h.Get("Content-Type") != "text/markdown; charset=utf-8" || h.Get("ETag") != `"`+f.SHA256+`"` || !strings.HasPrefix(h.Get("Content-Disposition"), "inline") {
+			t.Fatalf("%s headers: %v", name, h)
+		}
+		if !strings.Contains(h.Get("Vary"), "Accept") || !strings.Contains(h.Get("Vary"), "Sec-Fetch-Dest") {
+			t.Fatalf("%s vary: %q", name, h.Get("Vary"))
+		}
+		// Cloudflare ignores Vary, so neither form may sit in a shared cache.
+		if h.Get("Cache-Control") != "private, no-cache" {
+			t.Fatalf("%s cache-control: %q", name, h.Get("Cache-Control"))
+		}
+	}
+}
+
+func TestMarkdownRenderedForBrowsers(t *testing.T) {
+	e := newEnv(t)
+	f := e.upload(t, "notes.md", sampleMarkdown, "")
+	rec := e.do(browser(urlPath(f)))
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+	h := rec.Header()
+	if h.Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("content type %q", h.Get("Content-Type"))
+	}
+	if v := h.Get("Vary"); !strings.Contains(v, "Accept") || !strings.Contains(v, "Sec-Fetch-Dest") {
+		t.Fatalf("vary %q", v)
+	}
+	// The page and the file must never share a cache entry or validator.
+	if h.Get("ETag") == `"`+f.SHA256+`"` || !strings.Contains(h.Get("Cache-Control"), "private") {
+		t.Fatalf("cache headers: %v", h)
+	}
+	csp := h.Get("Content-Security-Policy")
+	for _, want := range []string{"default-src 'none'", "script-src 'none'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'"} {
+		if !strings.Contains(csp, want) {
+			t.Fatalf("csp %q lacks %q", csp, want)
+		}
+	}
+	if strings.Contains(csp, "unsafe-inline") {
+		t.Fatalf("csp allows unsafe-inline: %q", csp)
+	}
+	if h.Get("X-Content-Type-Options") != "nosniff" || h.Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("headers: %v", h)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"<h1", "Trip notes</h1>", "<table>", "<td>1</td>", `type="checkbox"`, "checked",
+		`<code class="language-go">`, "fmt.Println(&#34;&lt;hi&gt;&#34;)",
+		`<img src="map.png" alt="map"`, `href="other.md"`, `href="https://example.com"`,
+		"notes.md", "?raw=1", "?download=1", "Raw", "Download",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page lacks %q", want)
+		}
+	}
+	for _, bad := range []string{"<script", "javascript:", "onerror", "alert("} {
+		if strings.Contains(strings.ToLower(body), bad) {
+			t.Errorf("page contains %q", bad)
+		}
+	}
+	// HEAD matches GET without a body.
+	head := browser(urlPath(f))
+	head.Method = http.MethodHead
+	if rec := e.do(head); rec.Code != 200 || rec.Body.Len() != 0 || rec.Header().Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("head: %d %q %v", rec.Code, rec.Body, rec.Header())
+	}
+}
+
+func TestMarkdownBrowserWithoutFetchMetadata(t *testing.T) {
+	e := newEnv(t)
+	f := e.upload(t, "notes.md", sampleMarkdown, "")
+	req := httptest.NewRequest(http.MethodGet, urlPath(f), nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+	if rec := e.do(req); rec.Header().Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("older browser got %q", rec.Header().Get("Content-Type"))
+	}
+}
+
+func TestMarkdownRawAndDownloadLinks(t *testing.T) {
+	e := newEnv(t)
+	f := e.upload(t, "notes.md", sampleMarkdown, "")
+	rec := e.do(browser(urlPath(f) + "?raw=1"))
+	if rec.Body.String() != sampleMarkdown || rec.Header().Get("Content-Type") != "text/markdown; charset=utf-8" ||
+		!strings.HasPrefix(rec.Header().Get("Content-Disposition"), "inline") {
+		t.Fatalf("raw: %v %q", rec.Header(), rec.Body)
+	}
+	rec = e.do(browser(urlPath(f) + "?download=1"))
+	if rec.Body.String() != sampleMarkdown || !strings.HasPrefix(rec.Header().Get("Content-Disposition"), `attachment; filename=notes.md`) {
+		t.Fatalf("download: %v %q", rec.Header(), rec.Body)
+	}
+	// A browser range request (resuming, seeking) gets bytes.
+	req := browser(urlPath(f))
+	req.Header.Set("Range", "bytes=2-6")
+	if rec := e.do(req); rec.Code != http.StatusPartialContent || rec.Body.String() != sampleMarkdown[2:7] {
+		t.Fatalf("range: %d %q", rec.Code, rec.Body)
+	}
+}
+
+func TestMarkdownDetection(t *testing.T) {
+	e := newEnv(t)
+	cases := []struct {
+		name, contentType string
+		render            bool
+	}{
+		{"a.md", "", true},
+		{"b.markdown", "", true},
+		{"c.MD", "", true},
+		// Agents upload Markdown as text/plain so it opens inline.
+		{"d.md", "text/plain; charset=utf-8", true},
+		{"e.txt", "text/markdown", true},
+		{"f.txt", "", false},
+		{"g.md", "text/html; charset=utf-8", false},
+		{"h.md", "application/octet-stream", true}, // detected from the name
+		{"i.html", "", false},
+	}
+	for _, c := range cases {
+		f := e.uploadTyped(t, c.name, c.contentType, "# hi\n")
+		rec := e.do(browser(urlPath(f)))
+		got := rec.Header().Get("Content-Type") == "text/html; charset=utf-8" && strings.Contains(rec.Body.String(), "<h1")
+		if c.name == "i.html" {
+			got = rec.Body.String() != "# hi\n"
+		}
+		if got != c.render {
+			t.Errorf("%s (%q): rendered=%v, want %v (%q)", c.name, c.contentType, got, c.render, rec.Header().Get("Content-Type"))
+		}
+	}
+}
+
+func TestMarkdownTooLargeIsServedRaw(t *testing.T) {
+	e := newEnv(t)
+	big := "# big\n" + strings.Repeat("x", maxRenderBytes)
+	f := e.upload(t, "big.md", big, "")
+	rec := e.do(browser(urlPath(f)))
+	if rec.Body.Len() != len(big) || rec.Header().Get("Content-Type") != "text/markdown; charset=utf-8" {
+		t.Fatalf("big: %q %d", rec.Header().Get("Content-Type"), rec.Body.Len())
+	}
+}
+
+func TestMarkdownRenderedViewKeepsAccessChecks(t *testing.T) {
+	e := newEnv(t)
+	f := e.upload(t, "secret.md", "# classified\n", "hunter22")
+	// No credentials: the gate, not the document.
+	rec := e.do(browser(urlPath(f)))
+	if rec.Code != http.StatusUnauthorized || strings.Contains(rec.Body.String(), "classified") {
+		t.Fatalf("anonymous: %d %q", rec.Code, rec.Body)
+	}
+	// Basic auth opens the rendered page and records one view.
+	req := browser(urlPath(f))
+	req.SetBasicAuth("", "hunter22")
+	rec = e.do(req)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "classified</h1>") {
+		t.Fatalf("authorized: %d %q", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Header().Get("Cache-Control"), "no-store") {
+		t.Fatalf("restricted page cacheable: %q", rec.Header().Get("Cache-Control"))
+	}
+	var views int
+	for _, ev := range e.events(t) {
+		if ev.Event == "view" && ev.Via == "basic_auth" && ev.FileID == f.ID {
+			views++
+		}
+	}
+	if views != 1 {
+		t.Fatalf("views logged: %d", views)
+	}
+}
+
+func TestNonMarkdownUnchangedForBrowsers(t *testing.T) {
+	e := newEnv(t)
+	f := e.upload(t, "hello.txt", "hello", "")
+	rec := e.do(browser(urlPath(f)))
+	if rec.Body.String() != "hello" || rec.Header().Get("Content-Type") != "text/plain; charset=utf-8" {
+		t.Fatalf("txt: %v %q", rec.Header(), rec.Body)
+	}
+	if rec.Header().Get("Vary") != "" {
+		t.Fatalf("txt vary: %q", rec.Header().Get("Vary"))
+	}
+}
+
+// The page's only style block must match the hash the CSP allows, or the
+// browser drops the styling.
+func TestMarkdownPageStyleMatchesCSP(t *testing.T) {
+	e := newEnv(t)
+	f := e.upload(t, "notes.md", "# hi\n", "")
+	rec := e.do(browser(urlPath(f)))
+	body := rec.Body.String()
+	_, rest, _ := strings.Cut(body, "<style>")
+	css, _, ok := strings.Cut(rest, "</style>")
+	if !ok || strings.Count(body, "<style") != 1 {
+		t.Fatalf("style block: %q", body)
+	}
+	sum := sha256.Sum256([]byte(css))
+	want := "style-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, want) {
+		t.Fatalf("csp %q lacks %q", csp, want)
+	}
+}

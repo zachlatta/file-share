@@ -181,6 +181,17 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	started := time.Now()
 	cw := &countingWriter{ResponseWriter: w}
+	if isMarkdown(f) {
+		// One URL, two forms: a page for browsers and the bytes for
+		// everything else. Cloudflare ignores Vary, so neither form may
+		// sit in a shared cache.
+		w.Header().Set("Vary", markdownVary)
+		w.Header().Set("Cache-Control", "private, no-cache")
+		if wantsPage(r) && h.servePage(cw, r, f) {
+			h.logRequest(r, f, cw, time.Since(started))
+			return
+		}
+	}
 	h.send(cw, r, f, 0)
 	h.logRequest(r, f, cw, time.Since(started))
 }
