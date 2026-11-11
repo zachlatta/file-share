@@ -160,8 +160,10 @@ instead of this API, so they never need the secret.
   stored as `text/markdown`, or as `text/plain` with a `.md`/`.markdown` name, is rendered like a
   GitHub Gist (GitHub-flavored Markdown: tables, task lists, footnotes; light and dark theme)
   when a browser navigates to it (`Sec-Fetch-Dest: document`). A client that sends no fetch
-  metadata gets the page only if its `Accept` names `text/html`, so `curl -H 'Accept: text/html'`
-  and link-preview bots that send it get HTML too. Default `curl`, `wget`, most HTTP libraries,
+  metadata gets the page only if its `Accept` gives `text/html` a strictly higher q than
+  `text/markdown`, `text/plain` and the stored type (counting `text/*` and `*/*`), so
+  `curl -H 'Accept: text/html'` and link-preview bots that prefer HTML get HTML too, while
+  `Accept: */*` or `text/markdown, text/html;q=0.5` get the bytes. Default `curl`, `wget`, most HTTP libraries,
   `fetch()`, iframes and range requests get the exact stored bytes and Content-Type as before.
   The page header has **Raw** (`?raw=1`, the bytes inline) and **Download** (`?download=1`)
   links; if the page was opened with `?password=`, the links carry it over. Both forms send
