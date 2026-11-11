@@ -54,12 +54,12 @@ func isMarkdown(f files.File) bool {
 	return false
 }
 
-// wantsPage reports whether the request is a browser opening the file as a
-// page. Browsers send Sec-Fetch-Dest: document for a top-level navigation;
+// wantsPage reports whether the request is a browser opening f as a page.
+// Browsers send Sec-Fetch-Dest: document for a top-level navigation;
 // fetch(), images and iframes send something else. Clients without fetch
-// metadata get the page only if Accept names text/html, which curl, wget and
-// HTTP libraries do not send by default.
-func wantsPage(r *http.Request) bool {
+// metadata get the page only if Accept prefers text/html to the file's own
+// types, which curl, wget and HTTP libraries do not do by default.
+func wantsPage(r *http.Request, f files.File) bool {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
@@ -70,27 +70,63 @@ func wantsPage(r *http.Request) bool {
 	if dest := r.Header.Get("Sec-Fetch-Dest"); dest != "" {
 		return dest == "document"
 	}
-	return acceptsHTML(r.Header.Get("Accept"))
+	return prefersHTML(r.Header.Get("Accept"), f.ContentType)
 }
 
-func acceptsHTML(accept string) bool {
-	for _, part := range strings.Split(accept, ",") {
-		mediaType, params, err := mime.ParseMediaType(strings.TrimSpace(part))
-		if err != nil || mediaType != "text/html" {
-			continue
-		}
-		if q, err := strconv.ParseFloat(params["q"], 64); err == nil && q == 0 {
+// prefersHTML reports whether accept gives text/html a strictly higher
+// quality than text/markdown, text/plain and the stored type.
+func prefersHTML(accept, stored string) bool {
+	storedType, _, _ := mime.ParseMediaType(stored)
+	html := acceptQuality(accept, "text/html")
+	for _, other := range []string{"text/markdown", "text/plain", storedType} {
+		if other != "" && acceptQuality(accept, other) >= html {
 			return false
 		}
-		return true
 	}
-	return false
+	return true
+}
+
+// acceptQuality is the q value accept gives mediaType, from its most specific
+// matching range (type/subtype, then type/*, then */*), or 0.
+func acceptQuality(accept, mediaType string) float64 {
+	major, _, _ := strings.Cut(mediaType, "/")
+	best, quality := -1, 0.0
+	for _, part := range strings.Split(accept, ",") {
+		rng, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil {
+			continue
+		}
+		specificity := -1
+		switch rng {
+		case mediaType:
+			specificity = 2
+		case major + "/*":
+			specificity = 1
+		case "*/*":
+			specificity = 0
+		}
+		if specificity <= best {
+			continue
+		}
+		q := 1.0
+		if v, err := strconv.ParseFloat(params["q"], 64); err == nil {
+			q = v
+		}
+		best, quality = specificity, q
+	}
+	return quality
 }
 
 var markdown = goldmark.New(
 	// Without html.WithUnsafe, goldmark drops raw HTML and dangerous link
 	// schemes such as javascript:. The sanitizer below is a second line.
-	goldmark.WithExtensions(extension.GFM, extension.Footnote),
+	goldmark.WithExtensions(
+		// GitHub-flavored Markdown (extension.GFM), with table columns
+		// aligned by the align attribute, since the sanitizer strips style.
+		extension.Linkify, extension.Strikethrough, extension.TaskList,
+		extension.NewTable(extension.WithTableCellAlignMethod(extension.TableCellAlignAttribute)),
+		extension.Footnote,
+	),
 	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
 )
 
@@ -242,7 +278,7 @@ h2{font-size:1.5em;padding-bottom:.3em;border-bottom:1px solid var(--border)}
 h3{font-size:1.25em}h4{font-size:1em}h5{font-size:.875em}h6{font-size:.85em;color:var(--muted)}
 p,blockquote,ul,ol,dl,table,pre,details{margin:0 0 1rem}
 ul,ol{padding-left:2em}li+li{margin-top:.25em}
-li:has(>input[type=checkbox]){list-style:none}li>input[type=checkbox]{margin:0 .2em .25em -1.4em;vertical-align:middle}
+li:has(>input[type=checkbox]),li:has(>p>input[type=checkbox]){list-style:none}li>input[type=checkbox],li>p>input[type=checkbox]{margin:0 .2em .25em -1.4em;vertical-align:middle}
 blockquote{padding:0 1em;color:var(--muted);border-left:.25em solid var(--border)}
 hr{height:.25em;margin:1.5rem 0;padding:0;border:0;background:var(--border)}
 code,pre{font:85%/1.45 ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace}

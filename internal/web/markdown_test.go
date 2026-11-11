@@ -309,3 +309,50 @@ func TestMarkdownLinksKeepQueryPassword(t *testing.T) {
 		t.Fatalf("wrong password: %d", rec.Code)
 	}
 }
+
+// Without fetch metadata, Accept decides: HTML only when the client prefers
+// it strictly over Markdown, plain text and the stored type.
+func TestMarkdownAcceptNegotiation(t *testing.T) {
+	e := newEnv(t)
+	f := e.upload(t, "notes.md", "# hi\n", "")
+	cases := map[string]bool{
+		"text/html, */*;q=0.8": true,
+		"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8": true,
+		"text/html":                            true,
+		"text/html;q=0.9, text/*;q=0.5":        true,
+		"*/*":                                  false,
+		"text/*":                               false,
+		"text/html, text/*":                    false,
+		"text/markdown, text/html;q=0.5":       false,
+		"text/markdown;q=1.0, text/html;q=0.5": false,
+		"text/html;q=0.5, text/plain;q=0.5":    false,
+		"text/html;q=0":                        false,
+		"application/json":                     false,
+		"":                                     false,
+	}
+	for accept, page := range cases {
+		req := httptest.NewRequest(http.MethodGet, urlPath(f), nil)
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		got := e.do(req).Header().Get("Content-Type") == "text/html; charset=utf-8"
+		if got != page {
+			t.Errorf("Accept %q: page=%v, want %v", accept, got, page)
+		}
+	}
+}
+
+func TestMarkdownTableAlignmentAndLooseTaskLists(t *testing.T) {
+	html, err := renderMarkdown([]byte("| l | c | r |\n|:--|:-:|--:|\n| 1 | 2 | 3 |\n\n- [x] one\n\n- [ ] two\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`<th align="left">`, `<td align="center">`, `<td align="right">`, `type="checkbox"`} {
+		if !strings.Contains(string(html), want) {
+			t.Errorf("rendered lacks %q: %s", want, html)
+		}
+	}
+	if !strings.Contains(markdownCSS, "li:has(>p>input[type=checkbox])") {
+		t.Errorf("loose task list items keep their bullets")
+	}
+}

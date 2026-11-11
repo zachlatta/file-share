@@ -190,7 +190,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		// sit in a shared cache.
 		w.Header().Set("Vary", markdownVary)
 		w.Header().Set("Cache-Control", "private, no-cache")
-		if wantsPage(r) && h.servePage(cw, r, f, via) {
+		if wantsPage(r, f) && h.servePage(cw, r, f, via) {
 			h.logRequest(r, f, cw, time.Since(started))
 			return
 		}
