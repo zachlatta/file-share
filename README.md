@@ -156,6 +156,18 @@ instead of this API, so they never need the secret.
 - `GET /<ns>/<name>` serves the current version with range requests, ETags and
   `Content-Disposition: inline`. Add `?download` to get an attachment instead.
 - `GET /<ns>/` serves `index.html` if the namespace has one.
+- **Markdown opens as a readable page in a browser, and stays a file everywhere else.** A file
+  stored as `text/markdown`, or as `text/plain` with a `.md`/`.markdown` name, is rendered like a
+  GitHub Gist (GitHub-flavored Markdown: tables, task lists, footnotes; light and dark theme)
+  when a browser navigates to it (`Sec-Fetch-Dest: document`, or `Accept` naming `text/html`
+  from a client without fetch metadata). `curl`, `wget`, scripts, `fetch()` and range requests
+  get the exact stored bytes and Content-Type as before. The page header has **Raw**
+  (`?raw=1`, the bytes inline) and **Download** (`?download=1`) links. Both forms send
+  `Vary: Accept, Sec-Fetch-Dest` and `Cache-Control: private`, so no shared cache mixes them.
+  Raw HTML in the Markdown is dropped and the output is sanitized (bluemonday); the page has a
+  strict CSP with no script. Relative links and images resolve next to the file. The page goes
+  through the same password, Hack Club sign-in and audit checks as the file. Files over 512 KB
+  are served raw.
 - HTML is served as an ordinary page, so uploaded sites and maps work fully. A CSP sandbox was
   tried and dropped, because the opaque origin it creates disables Cache Storage and broke a
   MapLibre map. This is safe because only the owner can upload, OAuth and the API never use
