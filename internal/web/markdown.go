@@ -223,14 +223,12 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request, f files.File
 		http.Error(w, "could not render this file", http.StatusInternalServerError)
 		return true
 	}
+	setPageHeaders(w)
 	header := w.Header()
-	header.Set("Content-Type", "text/html; charset=utf-8")
 	header.Set("Content-Length", strconv.Itoa(page.Len()))
 	header.Set("Content-Security-Policy", markdownCSP)
 	header.Set("X-Content-Type-Options", "nosniff")
-	header.Set("X-Frame-Options", "DENY")
 	header.Set("Referrer-Policy", "no-referrer")
-	header.Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(page.Bytes())
