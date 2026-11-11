@@ -253,3 +253,59 @@ func TestMarkdownPageStyleMatchesCSP(t *testing.T) {
 		t.Fatalf("csp %q lacks %q", csp, want)
 	}
 }
+
+func TestMarkdownHonorsStoredCharset(t *testing.T) {
+	e := newEnv(t)
+	latin := e.uploadTyped(t, "latin.md", "text/plain; charset=iso-8859-1", "# Caf\xe9\n")
+	rec := e.do(browser(urlPath(latin)))
+	if rec.Header().Get("Content-Type") != "text/html; charset=utf-8" || !strings.Contains(rec.Body.String(), "Café</h1>") {
+		t.Fatalf("latin-1: %q %q", rec.Header().Get("Content-Type"), rec.Body)
+	}
+	win := e.uploadTyped(t, "win.md", "text/markdown; charset=windows-1252", "# \x93quoted\x94\n")
+	if rec := e.do(browser(urlPath(win))); !strings.Contains(rec.Body.String(), "“quoted”</h1>") {
+		t.Fatalf("windows-1252: %q", rec.Body)
+	}
+	// Bytes that are not valid in the declared (or default UTF-8) charset,
+	// or a charset we cannot decode, are served raw rather than garbled.
+	for _, c := range []struct{ name, contentType, body string }{
+		{"bad.md", "text/markdown", "# Caf\xe9\n"},
+		{"bad8.md", "text/plain; charset=utf-8", "# Caf\xe9\n"},
+		{"odd.md", "text/markdown; charset=x-no-such-charset", "# hi\n"},
+	} {
+		f := e.uploadTyped(t, c.name, c.contentType, c.body)
+		rec := e.do(browser(urlPath(f)))
+		if rec.Body.String() != c.body || rec.Header().Get("Content-Type") != c.contentType {
+			t.Errorf("%s: %q %q", c.name, rec.Header().Get("Content-Type"), rec.Body)
+		}
+	}
+}
+
+func TestMarkdownLinksKeepQueryPassword(t *testing.T) {
+	e := newEnv(t)
+	f := e.upload(t, "secret.md", "# classified\n", "p&ss word")
+	rec := e.do(browser(urlPath(f) + "?password=p%26ss+word"))
+	body := rec.Body.String()
+	if rec.Code != 200 || !strings.Contains(body, "classified</h1>") {
+		t.Fatalf("page: %d %q", rec.Code, body)
+	}
+	for _, link := range []string{`href="?password=p%26ss&#43;word&amp;raw=1"`, `href="?password=p%26ss&#43;word&amp;download=1"`} {
+		if !strings.Contains(body, link) {
+			t.Fatalf("page lacks %s: %q", link, body)
+		}
+	}
+	for _, q := range []string{"?password=p%26ss+word&raw=1", "?password=p%26ss+word&download=1"} {
+		if rec := e.do(browser(urlPath(f) + q)); rec.Code != 200 || rec.Body.String() != "# classified\n" {
+			t.Fatalf("%s: %d %q", q, rec.Code, rec.Body)
+		}
+	}
+	// Other ways in never put a password into the page.
+	req := browser(urlPath(f))
+	req.SetBasicAuth("", "p&ss word")
+	if body := e.do(req).Body.String(); strings.Contains(body, "password=") || !strings.Contains(body, `href="?raw=1"`) {
+		t.Fatalf("basic auth page: %q", body)
+	}
+	// A wrong query password still gets the gate.
+	if rec := e.do(browser(urlPath(f) + "?password=nope&raw=1")); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password: %d", rec.Code)
+	}
+}

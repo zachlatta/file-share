@@ -9,16 +9,19 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
+	"golang.org/x/text/encoding/htmlindex"
 
 	"github.com/zachlatta/file-share/internal/files"
 )
@@ -110,9 +113,45 @@ func renderMarkdown(src []byte) (template.HTML, error) {
 	return template.HTML(markdownPolicy.SanitizeBytes(buf.Bytes())), nil
 }
 
-// servePage renders f as a page. It returns false, having written nothing,
-// if f should be served raw instead (too large to render).
-func (h *Handler) servePage(w http.ResponseWriter, r *http.Request, f files.File) bool {
+// decodeMarkdown converts src from the stored charset to UTF-8, the way a
+// browser would read the raw file. It reports false if the charset is unknown
+// or the bytes are not valid in it; such files are served raw, not garbled.
+// No charset means UTF-8.
+func decodeMarkdown(src []byte, contentType string) ([]byte, bool) {
+	_, params, _ := mime.ParseMediaType(contentType)
+	switch charset := strings.ToLower(strings.TrimSpace(params["charset"])); charset {
+	case "", "utf-8", "utf8", "us-ascii":
+		return src, utf8.Valid(src)
+	default:
+		enc, err := htmlindex.Get(charset)
+		if err != nil {
+			return nil, false
+		}
+		out, err := enc.NewDecoder().Bytes(src)
+		if err != nil || !utf8.Valid(out) || bytes.ContainsRune(out, utf8.RuneError) {
+			return nil, false
+		}
+		return out, true
+	}
+}
+
+// pageLinks builds the Raw and Download links. A visitor who opened the page
+// with ?password= carries it over, because those links replace the query; the
+// visitor already holds it in the address bar and query strings are never
+// logged. Every other way in (cookie, Basic auth, sign-in) needs nothing.
+func pageLinks(r *http.Request, via string) (raw, download string) {
+	prefix := "?"
+	if via == "password_query" {
+		prefix += url.Values{"password": {r.URL.Query().Get("password")}}.Encode() + "&"
+	}
+	link := func(key string) string { return prefix + key + "=1" }
+	return link("raw"), link("download")
+}
+
+// servePage renders f as a page; via is how a restricted file was opened.
+// It returns false, having written nothing, if f should be served raw
+// instead (too large, or not decodable).
+func (h *Handler) servePage(w http.ResponseWriter, r *http.Request, f files.File, via string) bool {
 	if f.Size > maxRenderBytes {
 		return false
 	}
@@ -130,14 +169,20 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request, f files.File
 		h.notFound(w, r, err)
 		return true
 	}
+	src, ok := decodeMarkdown(src, v.ContentType)
+	if !ok {
+		return false
+	}
 	body, err := renderMarkdown(src)
 	if err != nil {
 		http.Error(w, "could not render this file", http.StatusInternalServerError)
 		return true
 	}
+	rawLink, downloadLink := pageLinks(r, via)
 	var page bytes.Buffer
 	if err := markdownPage.Execute(&page, markdownData{
 		Name: path.Base(f.Name), Size: humanSize(v.Size), Updated: v.CreatedAt.UTC().Format(time.DateOnly), Body: body,
+		Raw: rawLink, Download: downloadLink,
 	}); err != nil {
 		http.Error(w, "could not render this file", http.StatusInternalServerError)
 		return true
@@ -170,6 +215,7 @@ func humanSize(n int64) string {
 
 type markdownData struct {
 	Name, Size, Updated string
+	Raw, Download       string
 	Body                template.HTML
 }
 
@@ -220,7 +266,7 @@ var markdownPage = template.Must(template.New("markdown").Parse(`<!doctype html>
 <style>` + markdownCSS + `</style></head>
 <body><main><div class="file">
 <div class="bar"><div><span class="name">{{.Name}}</span><span class="meta">{{.Size}} · {{.Updated}}</span></div>
-<nav class="actions"><a href="?raw=1">Raw</a><a href="?download=1">Download</a></nav></div>
+<nav class="actions"><a href="{{.Raw}}">Raw</a><a href="{{.Download}}">Download</a></nav></div>
 <article>{{.Body}}</article>
 </div></main></body></html>
 `))
