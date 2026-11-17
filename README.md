@@ -217,8 +217,9 @@ so writes fail. A real run hashes each old object, skips any whose bytes do not 
 recorded size and SHA-256 (or that are missing), copies it to its content key unless that
 content is already stored, re-reads and checks the copy, and only then repoints its versions
 in one transaction. Each object commits on its own, so an interrupted run can simply be
-started again. Old objects stay in place, and the purge leaves them alone, until
-`cleanup-legacy-blobs -confirm` deletes those that nothing references any more.
+started again. Old objects stay in place as copies until `cleanup-legacy-blobs -confirm`
+deletes them; if a file is purged first, its old objects go with its content, so `purge_file`
+still destroys the bytes. `-limit` counts moved objects, so bad objects never stall a batch.
 
 ## Configuration
 

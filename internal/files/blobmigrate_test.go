@@ -300,3 +300,109 @@ func TestLegacyObjectsAreKeptUntilConfirmedCleanup(t *testing.T) {
 		t.Fatalf("second cleanup = %+v, %v", again, err)
 	}
 }
+
+func (h *harness) pendingLegacy(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := h.svc.db.QueryRow(context.Background(), `SELECT count(*) FROM blob_migrations WHERE cleaned_at IS NULL`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// purge_file destroys a file's bytes, including the legacy copies that
+// migrate-blobs kept as a safety net, while other files' copies stay.
+func TestPurgeFileAfterMigrationDeletesLegacyCopies(t *testing.T) {
+	h, files := legacyFixture(t)
+	ctx := context.Background()
+	if _, err := h.svc.MigrateBlobs(ctx, MigrateBlobsOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	before := len(h.keysWithPrefix("blobs/"))
+	if err := h.svc.PurgeFile(ctx, files[2].ID); err != nil {
+		t.Fatal(err)
+	}
+	// solo and solo v2: two content objects and two legacy objects gone.
+	if got := h.keysWithPrefix("blobs/"); len(got) != before-4 {
+		t.Fatalf("keys after purge_file = %v", got)
+	}
+	if n := h.pendingLegacy(t); n != 2 {
+		t.Fatalf("pending legacy objects = %d, want the two dup copies", n)
+	}
+	if h.read(t, files[0], 0) != "dup" {
+		t.Fatal("other files damaged")
+	}
+}
+
+// The hourly purge does the same once a migrated file's retention ends.
+func TestPurgeAfterMigrationDeletesLegacyCopies(t *testing.T) {
+	h, files := legacyFixture(t)
+	ctx := context.Background()
+	if _, err := h.svc.MigrateBlobs(ctx, MigrateBlobsOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.Delete(ctx, files[2].ID); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.t = h.clock.t.Add(31 * 24 * time.Hour)
+	res, err := h.svc.Purge(ctx)
+	if err != nil || res.Blobs != 4 {
+		t.Fatalf("purge = %+v, %v", res, err)
+	}
+	if n := h.pendingLegacy(t); n != 2 {
+		t.Fatalf("pending legacy objects = %d", n)
+	}
+	// Two dup legacy objects and the dup content object remain.
+	if got := h.keysWithPrefix("blobs/"); len(got) != 3 {
+		t.Fatalf("keys = %v", got)
+	}
+}
+
+// If the purge could not delete them (storage down), cleanup-legacy-blobs
+// deletes legacy copies whose content nothing references any more.
+func TestCleanupDeletesLegacyCopiesOfPurgedContent(t *testing.T) {
+	h, files := legacyFixture(t)
+	ctx := context.Background()
+	if _, err := h.svc.MigrateBlobs(ctx, MigrateBlobsOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.flaky.failDeletes.Store(true)
+	if err := h.svc.PurgeFile(ctx, files[2].ID); err == nil {
+		t.Fatal("purge_file with storage down reported success")
+	}
+	h.flaky.failDeletes.Store(false)
+	// The content copy is gone too, as if a later sweep removed it.
+	for _, body := range []string{"solo", "solo v2"} {
+		if _, err := h.svc.deleteBlobIfUnused(ctx, contentKey(sha(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rep, err := h.svc.CleanupLegacyBlobs(ctx, true)
+	if err != nil || rep.Deleted != 4 || len(rep.Skipped) != 0 {
+		t.Fatalf("cleanup = %+v, %v", rep, err)
+	}
+	if got := h.keysWithPrefix("blobs/"); len(got) != 1 || got[0] != contentKey(sha("dup")) {
+		t.Fatalf("keys after cleanup = %v", got)
+	}
+}
+
+// -limit counts migrated objects, so objects that must be skipped cannot
+// stall a run that is done in small batches.
+func TestMigrateBlobsLimitSkipsBadObjects(t *testing.T) {
+	h, _ := legacyFixture(t)
+	ctx := context.Background()
+	// A missing object that sorts before every other key.
+	bad := "blobs/00000000-0000-0000-0000-000000000000"
+	if _, err := h.svc.db.Exec(ctx, `INSERT INTO blobs (key, sha256, size, created_at) VALUES ($1, $2, 3, now())`, bad, sha("dup")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.db.Exec(ctx, `UPDATE versions SET blob_key = $1 WHERE blob_key = (SELECT min(blob_key) FROM versions WHERE sha256 = $2)`, bad, sha("dup")); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []int{1, 1, 1, 0} {
+		rep, err := h.svc.MigrateBlobs(ctx, MigrateBlobsOptions{Limit: 1})
+		if err != nil || rep.Migrated != want {
+			t.Fatalf("run %d = %+v, %v; want %d migrated", i+1, rep, err, want)
+		}
+	}
+}

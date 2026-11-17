@@ -21,8 +21,10 @@ import (
 //  2. Under both keys' blob locks: copy it to blobs/sha256/<hex> unless that
 //     content is already stored, re-read the copy and check its hash, then
 //     repoint every version that used the legacy key, in one transaction.
-//  3. Record the move in blob_migrations. The legacy object stays (the
-//     orphan sweep skips it) until CleanupLegacyBlobs deletes it.
+//  3. Record the move in blob_migrations. The legacy object stays as a copy
+//     until CleanupLegacyBlobs deletes it, or until nothing uses its content
+//     any more: then Purge, PurgeFile or the sweep deletes it with the
+//     content object.
 //
 // Readers resolve a version's key when they open it, and both the legacy and
 // the content object hold the same bytes, so reads work throughout. Each
@@ -38,7 +40,8 @@ type MigrateBlobsOptions struct {
 	// Verify, in a dry run, also reads every legacy object and checks its
 	// hash. A real run always does.
 	Verify bool
-	// Limit stops a real run after this many objects (0: no limit).
+	// Limit stops a real run after migrating this many objects (0: no
+	// limit). Missing and mismatched objects do not count.
 	Limit int
 	// Progress, if set, receives one line per object.
 	Progress func(string)
@@ -148,12 +151,10 @@ func (s *Service) MigrateBlobs(ctx context.Context, opts MigrateBlobsOptions) (M
 	rep.SavedBytes = rep.LegacyBytes - rep.CopyBytes
 	rep.Remaining = rep.LegacyObjects
 
-	attempted := 0
 	for _, b := range legacy {
-		if !opts.DryRun && opts.Limit > 0 && attempted >= opts.Limit {
+		if !opts.DryRun && opts.Limit > 0 && rep.Migrated >= opts.Limit {
 			break
 		}
-		attempted++
 		problem, err := s.checkLegacyBlob(ctx, b, opts.DryRun && !opts.Verify)
 		if err != nil {
 			return rep, err
@@ -297,14 +298,15 @@ type CleanupLegacyReport struct {
 	PendingBytes int64 `json:"pending_bytes"`
 	Deleted      int   `json:"deleted"`
 	DeletedBytes int64 `json:"deleted_bytes"`
-	// Skipped objects are still referenced, or their content copy is
-	// missing; they are kept.
+	// Skipped objects are still referenced, or their content is in use and
+	// its copy does not verify; they are kept.
 	Skipped []string `json:"skipped,omitempty"`
 }
 
 // CleanupLegacyBlobs deletes legacy objects that MigrateBlobs has moved, once
-// nothing references them and their content copy is in place. Without
-// confirm it only reports what it would delete.
+// nothing references them and either their content copy is in place or
+// nothing uses that content either. Without confirm it only reports what it
+// would delete.
 func (s *Service) CleanupLegacyBlobs(ctx context.Context, confirm bool) (CleanupLegacyReport, error) {
 	rep := CleanupLegacyReport{Confirm: confirm}
 	rows, err := s.db.Query(ctx, `SELECT old_key, new_key, size FROM blob_migrations WHERE cleaned_at IS NULL ORDER BY old_key`)
@@ -333,14 +335,21 @@ func (s *Service) CleanupLegacyBlobs(ctx context.Context, confirm bool) (Cleanup
 			if err := lockBlob(ctx, tx, p.old); err != nil {
 				return err
 			}
-			var used bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM versions WHERE blob_key = $1)`, p.old).Scan(&used); err != nil {
+			var used, contentUsed bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM versions WHERE blob_key = $1), EXISTS (SELECT 1 FROM versions WHERE blob_key = $2)`,
+				p.old, p.new).Scan(&used, &contentUsed); err != nil {
 				return err
 			}
-			info, err := s.blobs.Stat(ctx, p.new)
-			if used || err != nil || info.Size != p.size {
+			if used {
 				rep.Skipped = append(rep.Skipped, p.old)
 				return nil
+			}
+			if contentUsed {
+				info, err := s.blobs.Stat(ctx, p.new)
+				if err != nil || info.Size != p.size {
+					rep.Skipped = append(rep.Skipped, p.old)
+					return nil
+				}
 			}
 			if _, err := tx.Exec(ctx, `DELETE FROM blobs WHERE key = $1`, p.old); err != nil {
 				return err

@@ -48,6 +48,13 @@ const orphanGrace = 24 * time.Hour
 
 func contentKey(sum string) string { return contentPrefix + sum }
 
+// keptLegacy is true when key ($1, or the column it is applied to) is a
+// migrated legacy object kept as a safety net: migrate-blobs moved it to a
+// content key that a version still uses. Once nothing uses that content,
+// the legacy copy is garbage like any other unreferenced object.
+const keptLegacy = `EXISTS (SELECT 1 FROM blob_migrations m WHERE m.old_key = %s AND m.cleaned_at IS NULL
+	AND EXISTS (SELECT 1 FROM versions WHERE blob_key = m.new_key))`
+
 // lockBlob takes key's blob lock until tx ends.
 func lockBlob(ctx context.Context, tx pgx.Tx, key string) error {
 	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key)
@@ -98,9 +105,10 @@ func (s *Service) releaseBlob(ctx context.Context, key string) {
 }
 
 // deleteBlobIfUnused deletes key's object and row, under its lock, unless a
-// version references it or it is a migrated legacy object awaiting
-// cleanup-legacy-blobs. If the object delete fails, the row stays for the
-// sweep to retry.
+// version references it or it is a migrated legacy object whose content is
+// still in use (see keptLegacy). Deleting a migrated legacy object marks its
+// migration cleaned. If the object delete fails, the row stays for the sweep
+// to retry.
 func (s *Service) deleteBlobIfUnused(ctx context.Context, key string) (bool, error) {
 	deleted := false
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
@@ -108,14 +116,16 @@ func (s *Service) deleteBlobIfUnused(ctx context.Context, key string) (bool, err
 			return err
 		}
 		var keep bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM versions WHERE blob_key = $1)
-			OR EXISTS (SELECT 1 FROM blob_migrations WHERE old_key = $1 AND cleaned_at IS NULL)`, key).Scan(&keep); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM versions WHERE blob_key = $1) OR `+fmt.Sprintf(keptLegacy, "$1"), key).Scan(&keep); err != nil {
 			return err
 		}
 		if keep {
 			return nil
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM blobs WHERE key = $1`, key); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE blob_migrations SET cleaned_at = $2 WHERE old_key = $1 AND cleaned_at IS NULL`, key, s.nowUTC()); err != nil {
 			return err
 		}
 		if err := s.blobs.Delete(ctx, key); err != nil {
@@ -128,12 +138,17 @@ func (s *Service) deleteBlobIfUnused(ctx context.Context, key string) (bool, err
 }
 
 // deleteUnusedBlobs deletes each of keys that nothing uses any more and
-// returns how many it deleted.
+// returns how many it deleted. When it deletes a content key, it also
+// deletes the legacy objects migrate-blobs moved to it, which were kept only
+// as copies of that content.
 func (s *Service) deleteUnusedBlobs(ctx context.Context, keys []string) (int, error) {
 	seen := map[string]bool{}
 	var errs []error
 	deleted := 0
-	for _, key := range keys {
+	queue := slices.Clone(keys)
+	for len(queue) > 0 {
+		key := queue[0]
+		queue = queue[1:]
 		if seen[key] {
 			continue
 		}
@@ -143,8 +158,16 @@ func (s *Service) deleteUnusedBlobs(ctx context.Context, keys []string) (int, er
 			errs = append(errs, err)
 			continue
 		}
-		if ok {
-			deleted++
+		if !ok {
+			continue
+		}
+		deleted++
+		if isContentKey(key) {
+			legacy, err := s.blobKeys(ctx, `SELECT old_key FROM blob_migrations WHERE new_key = $1 AND cleaned_at IS NULL`, key)
+			if err != nil {
+				errs = append(errs, err)
+			}
+			queue = append(queue, legacy...)
 		}
 	}
 	return deleted, errors.Join(errs...)
@@ -153,8 +176,8 @@ func (s *Service) deleteUnusedBlobs(ctx context.Context, keys []string) (int, er
 // purgeOrphans deletes, once they are older than orphanGrace: objects under
 // blobs/ and rows in blobs that no version references (bytes left when a
 // delete or a failed upload's cleanup failed), and staged uploads (left when
-// the server stopped mid-upload). Migrated legacy objects are kept for
-// cleanup-legacy-blobs.
+// the server stopped mid-upload). Migrated legacy objects whose content is
+// still in use are kept for cleanup-legacy-blobs.
 func (s *Service) purgeOrphans(ctx context.Context) (int, error) {
 	cutoff := s.now().Add(-orphanGrace)
 	var errs []error
@@ -177,7 +200,7 @@ func (s *Service) purgeOrphans(ctx context.Context) (int, error) {
 
 	candidates, err := s.blobKeys(ctx, `SELECT key FROM blobs b WHERE created_at < $1
 		AND NOT EXISTS (SELECT 1 FROM versions WHERE blob_key = b.key)
-		AND NOT EXISTS (SELECT 1 FROM blob_migrations WHERE old_key = b.key AND cleaned_at IS NULL)`, cutoff)
+		AND NOT `+fmt.Sprintf(keptLegacy, "b.key"), cutoff)
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -193,7 +216,7 @@ func (s *Service) purgeOrphans(ctx context.Context) (int, error) {
 	}
 	for batch := range slices.Chunk(old, 1000) {
 		used, err := s.blobKeys(ctx, `SELECT blob_key FROM versions WHERE blob_key = ANY($1)
-			UNION SELECT old_key FROM blob_migrations WHERE old_key = ANY($1) AND cleaned_at IS NULL`, batch)
+			UNION SELECT k FROM unnest($1::text[]) k WHERE `+fmt.Sprintf(keptLegacy, "k"), batch)
 		if err != nil {
 			errs = append(errs, err)
 			continue
