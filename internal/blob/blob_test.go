@@ -131,3 +131,121 @@ func TestStoreContract(t *testing.T) {
 		})
 	}
 }
+
+// Stat reports an object's size without reading it, and Copy duplicates an
+// object server-side, which is how staged uploads reach their content key.
+func TestStoreStatAndCopy(t *testing.T) {
+	for name, store := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			prefix := "contract-test/" + strings.ToLower(rand.Text()) + "/"
+			t.Cleanup(func() {
+				for _, k := range []string{"src", "dst", "empty", "empty-copy"} {
+					_ = store.Delete(context.Background(), prefix+k)
+				}
+			})
+			payload := []byte("bytes that get copied")
+			if err := store.Put(ctx, prefix+"src", bytes.NewReader(payload), int64(len(payload)), "text/plain"); err != nil {
+				t.Fatal(err)
+			}
+			info, err := store.Stat(ctx, prefix+"src")
+			if err != nil || info.Key != prefix+"src" || info.Size != int64(len(payload)) || info.Modified.IsZero() {
+				t.Fatalf("stat = %+v, %v", info, err)
+			}
+			if _, err := store.Stat(ctx, prefix+"missing"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("stat missing: %v", err)
+			}
+			if err := store.Copy(ctx, prefix+"src", prefix+"dst"); err != nil {
+				t.Fatalf("copy: %v", err)
+			}
+			obj, err := store.Get(ctx, prefix+"dst")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := io.ReadAll(obj)
+			_ = obj.Close()
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("copied = %q", got)
+			}
+			if err := store.Copy(ctx, prefix+"missing", prefix+"never"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("copy missing: %v", err)
+			}
+			if err := store.Put(ctx, prefix+"empty", strings.NewReader(""), 0, "text/plain"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Copy(ctx, prefix+"empty", prefix+"empty-copy"); err != nil {
+				t.Fatalf("copy empty: %v", err)
+			}
+			if info, err := store.Stat(ctx, prefix+"empty-copy"); err != nil || info.Size != 0 {
+				t.Fatalf("stat empty copy = %+v, %v", info, err)
+			}
+		})
+	}
+}
+
+// Objects over the single-request copy limit (5 GiB on S3) are copied with a
+// multipart copy. The limit is lowered here so a small object takes that
+// path; gofakes3 has no UploadPartCopy, so this runs against a real store.
+func TestS3MultipartCopy(t *testing.T) {
+	store, ok := stores(t)["real-s3"].(*S3)
+	if !ok {
+		t.Skip("set FILE_SHARE_TEST_S3_ENDPOINT to test multipart copy against a real store")
+	}
+	store.copyLimit = 1
+	ctx := context.Background()
+	prefix := "contract-test/" + strings.ToLower(rand.Text()) + "/"
+	t.Cleanup(func() {
+		_ = store.Delete(context.Background(), prefix+"src")
+		_ = store.Delete(context.Background(), prefix+"dst")
+	})
+	payload := bytes.Repeat([]byte("multipart copy "), 1000)
+	if err := store.Put(ctx, prefix+"src", bytes.NewReader(payload), int64(len(payload)), "text/plain"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Copy(ctx, prefix+"src", prefix+"dst"); err != nil {
+		t.Fatalf("multipart copy: %v", err)
+	}
+	obj, err := store.Get(ctx, prefix+"dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(obj)
+	_ = obj.Close()
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("copied %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+// ReadOnly passes reads through and refuses every write, so a dry run cannot
+// change the store.
+func TestReadOnly(t *testing.T) {
+	ctx := context.Background()
+	mem := NewMemory()
+	if err := mem.Put(ctx, "a", strings.NewReader("x"), 1, "text/plain"); err != nil {
+		t.Fatal(err)
+	}
+	ro := ReadOnly(mem)
+	if _, err := ro.Stat(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if obj, err := ro.Get(ctx, "a"); err != nil {
+		t.Fatal(err)
+	} else {
+		_ = obj.Close()
+	}
+	if list, err := ro.List(ctx, ""); err != nil || len(list) != 1 {
+		t.Fatalf("list = %v, %v", list, err)
+	}
+	for name, err := range map[string]error{
+		"put":    ro.Put(ctx, "b", strings.NewReader("x"), 1, "text/plain"),
+		"copy":   ro.Copy(ctx, "a", "b"),
+		"delete": ro.Delete(ctx, "a"),
+	} {
+		if !errors.Is(err, ErrReadOnly) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if keys := mem.Keys(); len(keys) != 1 {
+		t.Fatalf("keys = %v", keys)
+	}
+}

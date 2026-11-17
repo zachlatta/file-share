@@ -1,12 +1,15 @@
 // Package files is the file-sharing domain: namespaces, files, immutable
 // versions, soft deletion with a retention window, and passwords.
 //
-// Metadata lives in PostgreSQL; bytes live in a blob.Store under random keys
-// that are written once and never modified. Replacing a file adds a version;
-// rolling back adds a version that reuses an older version's blob; deleting a
-// file only marks it deleted. Purge permanently removes deleted files and
-// non-current versions once they are older than the retention window, and
-// deletes a blob only when no remaining version references it.
+// Metadata lives in PostgreSQL; bytes live in a blob.Store. Content is
+// addressed by its SHA-256: every version with the same bytes shares one
+// object at blobs/sha256/<hex>, written once and never modified (see
+// blobs.go). Replacing a file adds a version; rolling back adds a version
+// that reuses an older version's blob; deleting a file only marks it
+// deleted. Purge permanently removes deleted files and non-current versions
+// once they are older than the retention window, and deletes a blob only
+// when no remaining version references it, so shared bytes live until the
+// last file holding them is purged.
 package files
 
 import (
@@ -55,7 +58,10 @@ type Config struct {
 	// CompleteWait is how long a chunked completion request waits before
 	// returning ErrAssembling while assembly continues in the background.
 	CompleteWait time.Duration
-	Now          func() time.Time
+	// ReadOnly opens the database without running migrations, in read-only
+	// transactions, for dry runs against production.
+	ReadOnly bool
+	Now      func() time.Time
 }
 
 type Service struct {
@@ -65,6 +71,7 @@ type Service struct {
 	retention         time.Duration
 	maxBytes          int64
 	emailAuth         bool
+	readOnly          bool
 	now               func() time.Time
 	completeWait      time.Duration
 	completeTimeout   time.Duration
@@ -131,18 +138,27 @@ func Open(ctx context.Context, cfg Config) (*Service, error) {
 	if cfg.CompleteWait <= 0 {
 		cfg.CompleteWait = 60 * time.Second
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
-	if err := migrate(ctx, pool); err != nil {
-		pool.Close()
-		return nil, err
+	if cfg.ReadOnly {
+		poolCfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect to postgres: %w", err)
+	}
+	if !cfg.ReadOnly {
+		if err := migrate(ctx, pool); err != nil {
+			pool.Close()
+			return nil, err
+		}
 	}
 	closeCtx, closeCancel := context.WithCancel(context.Background())
 	return &Service{
 		db: pool, blobs: cfg.Blobs, baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		retention: cfg.Retention, maxBytes: cfg.MaxBytes, emailAuth: cfg.EmailLogin, now: cfg.Now,
+		retention: cfg.Retention, maxBytes: cfg.MaxBytes, emailAuth: cfg.EmailLogin, now: cfg.Now, readOnly: cfg.ReadOnly,
 		completeWait: cfg.CompleteWait, completeTimeout: 30 * time.Minute, completeResultTTL: 5 * time.Minute,
 		completing: make(map[string]*completion), closeCtx: closeCtx, closeCancel: closeCancel,
 	}, nil
@@ -268,13 +284,17 @@ func (s *Service) upload(ctx context.Context, in UploadInput, hash string) (File
 	} else if !errors.Is(err, ErrNotFound) {
 		return File{}, err
 	}
-	v, err := s.storeBlob(ctx, name, in.ContentType, in.Body, in.Size)
+	v, staging, err := s.stageBlob(ctx, name, in.ContentType, in.Body, in.Size)
 	if err != nil {
 		return File{}, err
 	}
+	defer s.dropStaging(ctx, staging)
 	now := s.nowUTC()
 	id := uuid.NewString()
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		if err := s.attachBlob(ctx, tx, v, staging); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO files (id, namespace, name, password_hash, allowed_emails, current_version, created_at, updated_at, expires_at)
 			VALUES ($1, $2, $3, NULLIF($4, ''), $5, 1, $6, $6, $7)`, id, ns, name, hash, emails, now, in.ExpiresAt); err != nil {
 			return err
@@ -282,7 +302,7 @@ func (s *Service) upload(ctx context.Context, in UploadInput, hash string) (File
 		return insertVersion(ctx, tx, id, 1, v, now, in.Client, "")
 	})
 	if err != nil {
-		_ = s.blobs.Delete(context.WithoutCancel(ctx), v.blobKey)
+		s.releaseBlob(ctx, v.blobKey)
 		if isUniqueViolation(err) {
 			return File{}, ErrExists
 		}
@@ -315,12 +335,13 @@ func (s *Service) Replace(ctx context.Context, id string, in ReplaceInput) (File
 	if err := checkVersion(f.Version, in.ExpectedVersion); err != nil {
 		return File{}, err // fail before sending the bytes
 	}
-	v, err := s.storeBlob(ctx, f.Name, in.ContentType, in.Body, in.Size)
+	v, staging, err := s.stageBlob(ctx, f.Name, in.ContentType, in.Body, in.Size)
 	if err != nil {
 		return File{}, err
 	}
-	if err := s.addVersion(ctx, f.ID, v, in.Client, in.Note, in.ExpectedVersion); err != nil {
-		_ = s.blobs.Delete(context.WithoutCancel(ctx), v.blobKey)
+	defer s.dropStaging(ctx, staging)
+	if err := s.addVersion(ctx, f.ID, v, staging, in.Client, in.Note, in.ExpectedVersion); err != nil {
+		s.releaseBlob(ctx, v.blobKey)
 		return File{}, err
 	}
 	return s.Get(ctx, f.ID)
@@ -340,7 +361,7 @@ func (s *Service) Rollback(ctx context.Context, id string, number int, client st
 	if err != nil {
 		return File{}, err
 	}
-	if err := s.addVersion(ctx, f.ID, old, client, fmt.Sprintf("rollback to v%d", number), 0); err != nil {
+	if err := s.addVersion(ctx, f.ID, old, "", client, fmt.Sprintf("rollback to v%d", number), 0); err != nil {
 		return File{}, err
 	}
 	return s.Get(ctx, f.ID)
@@ -353,11 +374,15 @@ func checkVersion(current, expected int) error {
 	return nil
 }
 
-// addVersion makes v the file's current version. expected, if set, must be
-// the current version, checked under the row lock.
-func (s *Service) addVersion(ctx context.Context, id string, v Version, client, note string, expected int) error {
+// addVersion makes v the file's current version, attaching its blob from
+// staging (or, with staging "", from bytes already stored). expected, if
+// set, must be the current version, checked under the row lock.
+func (s *Service) addVersion(ctx context.Context, id string, v Version, staging, client, note string, expected int) error {
 	now := s.nowUTC()
 	return pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		if err := s.attachBlob(ctx, tx, v, staging); err != nil {
+			return err
+		}
 		var current int
 		var deleted *time.Time
 		if err := tx.QueryRow(ctx, `SELECT current_version, deleted_at FROM files WHERE id = $1 FOR UPDATE`, id).Scan(&current, &deleted); err != nil {
@@ -387,20 +412,22 @@ func insertVersion(ctx context.Context, tx pgx.Tx, id string, number int, v Vers
 	return err
 }
 
-// storeBlob streams body into a new blob, computing size and SHA-256, and
-// enforcing MaxBytes. The content type is taken from the caller, then the
-// file extension, then content sniffing.
-func (s *Service) storeBlob(ctx context.Context, name, contentType string, body io.Reader, size int64) (Version, error) {
+// stageBlob streams body to a new staging key, computing size and SHA-256,
+// and enforcing MaxBytes. It returns the version (whose blob key is the
+// content key) and the staging key, which attachBlob copies from and the
+// caller deletes with dropStaging. The content type is taken from the
+// caller, then the file extension, then content sniffing.
+func (s *Service) stageBlob(ctx context.Context, name, contentType string, body io.Reader, size int64) (Version, string, error) {
 	if body == nil {
-		return Version{}, fmt.Errorf("%w: content is required", ErrInvalid)
+		return Version{}, "", fmt.Errorf("%w: content is required", ErrInvalid)
 	}
 	if s.maxBytes > 0 && size > s.maxBytes {
-		return Version{}, ErrTooLarge
+		return Version{}, "", ErrTooLarge
 	}
 	buffered := bufio.NewReaderSize(body, 512)
 	head, err := buffered.Peek(512)
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, bufio.ErrBufferFull) {
-		return Version{}, err
+		return Version{}, "", err
 	}
 	contentType = strings.TrimSpace(contentType)
 	if contentType == "" || contentType == "application/octet-stream" {
@@ -409,19 +436,20 @@ func (s *Service) storeBlob(ctx context.Context, name, contentType string, body 
 	hasher := sha256.New()
 	counter := &countingReader{r: buffered, limit: s.maxBytes}
 	reader := io.TeeReader(counter, hasher)
-	key := "blobs/" + uuid.NewString()
-	if err := s.blobs.Put(ctx, key, reader, size, contentType); err != nil {
-		_ = s.blobs.Delete(context.WithoutCancel(ctx), key)
+	staging := stagingPrefix + uuid.NewString()
+	if err := s.blobs.Put(ctx, staging, reader, size, contentType); err != nil {
+		s.dropStaging(ctx, staging)
 		if counter.exceeded {
-			return Version{}, ErrTooLarge
+			return Version{}, "", ErrTooLarge
 		}
-		return Version{}, fmt.Errorf("store bytes: %w", err)
+		return Version{}, "", fmt.Errorf("store bytes: %w", err)
 	}
 	if counter.exceeded {
-		_ = s.blobs.Delete(context.WithoutCancel(ctx), key)
-		return Version{}, ErrTooLarge
+		s.dropStaging(ctx, staging)
+		return Version{}, "", ErrTooLarge
 	}
-	return Version{blobKey: key, Size: counter.n, ContentType: contentType, SHA256: hex.EncodeToString(hasher.Sum(nil))}, nil
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	return Version{blobKey: contentKey(sum), Size: counter.n, ContentType: contentType, SHA256: sum}, staging, nil
 }
 
 type countingReader struct {
@@ -614,7 +642,7 @@ func (s *Service) PurgeFile(ctx context.Context, id string) error {
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	_, err = s.deleteOrphanBlobs(ctx, keys)
+	_, err = s.deleteUnusedBlobs(ctx, keys)
 	return err
 }
 
@@ -626,8 +654,8 @@ type PurgeResult struct {
 	Parts int `json:"parts"`
 	// Links counts expired upload links removed.
 	Links int `json:"links"`
-	// Orphans counts objects under blobs/ that no version referenced, such
-	// as bytes left when a purge's delete failed.
+	// Orphans counts unreferenced blobs swept after the grace period, such
+	// as bytes left when a purge's delete failed, and stale staged uploads.
 	Orphans int `json:"orphans"`
 }
 
@@ -697,7 +725,7 @@ func (s *Service) Purge(ctx context.Context) (PurgeResult, error) {
 		return PurgeResult{}, err
 	}
 	var blobErr, partErr, orphanErr error
-	res.Blobs, blobErr = s.deleteOrphanBlobs(ctx, keys)
+	res.Blobs, blobErr = s.deleteUnusedBlobs(ctx, keys)
 	res.Parts, partErr = s.purgeParts(ctx)
 	res.Orphans, orphanErr = s.purgeOrphans(ctx)
 	return res, errors.Join(blobErr, partErr, orphanErr)
@@ -709,78 +737,6 @@ func (s *Service) blobKeys(ctx context.Context, query string, args ...any) ([]st
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowTo[string])
-}
-
-// deleteOrphanBlobs deletes each blob no version references any more and
-// returns how many it deleted.
-func (s *Service) deleteOrphanBlobs(ctx context.Context, keys []string) (int, error) {
-	seen := map[string]bool{}
-	var errs []error
-	deleted := 0
-	for _, key := range keys {
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		var used bool
-		if err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM versions WHERE blob_key = $1)`, key).Scan(&used); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if used {
-			continue
-		}
-		if err := s.blobs.Delete(ctx, key); err != nil {
-			errs = append(errs, fmt.Errorf("delete blob %s: %w", key, err))
-			continue
-		}
-		deleted++
-	}
-	return deleted, errors.Join(errs...)
-}
-
-// orphanGrace protects a blob between storeBlob's Put and the INSERT of the
-// versions row that references it. An object is listed only once its Put has
-// finished, so an upload would have to stall for this long to be at risk.
-const orphanGrace = 24 * time.Hour
-
-// purgeOrphans deletes objects under blobs/ that are older than orphanGrace
-// and that no version references: bytes left when a purge's delete failed, or
-// when an upload failed and its cleanup delete failed too. Nothing can start
-// referencing an unreferenced key, because uploads always write a new key and
-// a rollback only reuses a key a version already holds.
-func (s *Service) purgeOrphans(ctx context.Context) (int, error) {
-	objects, err := s.blobs.List(ctx, "blobs/")
-	if err != nil {
-		return 0, err
-	}
-	cutoff := s.now().Add(-orphanGrace)
-	var old []string
-	for _, obj := range objects {
-		if obj.Modified.Before(cutoff) {
-			old = append(old, obj.Key)
-		}
-	}
-	deleted := 0
-	var errs []error
-	for batch := range slices.Chunk(old, 1000) {
-		used, err := s.blobKeys(ctx, `SELECT blob_key FROM versions WHERE blob_key = ANY($1)`, batch)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		for _, key := range batch {
-			if slices.Contains(used, key) {
-				continue
-			}
-			if err := s.blobs.Delete(ctx, key); err != nil {
-				errs = append(errs, fmt.Errorf("delete orphan blob %s: %w", key, err))
-				continue
-			}
-			deleted++
-		}
-	}
-	return deleted, errors.Join(errs...)
 }
 
 // ResolveExpiry validates file expiry options and resolves relative days at acceptance.

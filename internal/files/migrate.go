@@ -110,6 +110,31 @@ var migrations = []string{
 	`ALTER TABLE files ADD COLUMN expires_at timestamptz;
  ALTER TABLE upload_links ADD COLUMN file_expires_at timestamptz;
  CREATE INDEX files_expires ON files (expires_at) WHERE deleted_at IS NULL AND expires_at IS NOT NULL;`,
+	// Content-addressed storage. Every object versions can reference has a
+	// blobs row; new content lives at blobs/sha256/<hex> and is shared by
+	// every version with those bytes. The foreign key means a blob row can
+	// only go once no version references it. Existing random keys are
+	// recorded as they are; migrate-blobs moves them to content keys and
+	// records each move in blob_migrations, which keeps the old object until
+	// cleanup-legacy-blobs removes it.
+	`CREATE TABLE blobs (
+	key text PRIMARY KEY,
+	sha256 text NOT NULL,
+	size bigint NOT NULL,
+	created_at timestamptz NOT NULL
+ );
+ INSERT INTO blobs (key, sha256, size, created_at)
+	SELECT DISTINCT ON (blob_key) blob_key, sha256, size, created_at FROM versions ORDER BY blob_key, created_at;
+ ALTER TABLE versions ADD CONSTRAINT versions_blob_key_fkey FOREIGN KEY (blob_key) REFERENCES blobs (key);
+ CREATE INDEX blobs_created ON blobs (created_at);
+ CREATE TABLE blob_migrations (
+	old_key text PRIMARY KEY,
+	new_key text NOT NULL,
+	sha256 text NOT NULL,
+	size bigint NOT NULL,
+	migrated_at timestamptz NOT NULL,
+	cleaned_at timestamptz
+ );`,
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {

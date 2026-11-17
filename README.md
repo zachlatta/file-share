@@ -176,15 +176,49 @@ instead of this API, so they never need the secret.
 
 ## Storage
 
-- **PostgreSQL** holds metadata (`files`, `versions`) and the logs (`access_events`,
+- **PostgreSQL** holds metadata (`files`, `versions`, `blobs`) and the logs (`access_events`,
   `file_requests`). Migrations run at
   startup.
-- **S3-compatible object storage** holds bytes. Every version is written once under a random
-  key and never modified. Rollback reuses the old version's object. A purge deletes an object
-  only when no remaining version references it. If that delete fails (storage down), or a
-  failed upload leaves its object behind, the hourly purge lists `blobs/` and deletes any
-  object that is over 24 hours old and that no version references. Object-store versioning
-  is not needed, so this works on Garage, MinIO, R2 or S3. Addressing is path-style.
+- **S3-compatible object storage** holds bytes, addressed by content. Every version's bytes
+  live at `blobs/sha256/<hex>`, so identical bytes are stored once however many files,
+  versions and namespaces hold them. An upload streams to a unique `staging/` key while it is
+  hashed; then, in the transaction that records the version, the server keeps the existing
+  object if that content is already stored, or copies the staged bytes to the content key
+  (server-side, multipart above 5 GiB). The staged copy is then deleted. No key is ever
+  overwritten. Rollback reuses the old version's object.
+- **Each version is a reference to its blob.** A blob is deleted only once no version
+  references it, so a blob shared by a file that expires in 15 days and one that expires in
+  30 days lives until the second one is purged. A `blobs` table records every object, and a
+  foreign key from `versions` stops a referenced blob row from being removed. Uploads and
+  deletes of the same blob take a per-key PostgreSQL advisory lock that an upload holds until
+  its version is committed, so a purge never deletes bytes an upload has just decided to
+  reuse; if the purge wins, the upload stores the bytes again from its staged copy.
+- If a delete fails (storage down), or a server stops mid-upload, the hourly purge deletes
+  unreferenced blobs and staged uploads once they are over 24 hours old. Object-store
+  versioning is not needed, so this works on Garage, MinIO, R2 or S3. Addressing is
+  path-style.
+
+### Migrating older objects
+
+Objects stored before content addressing sit at random `blobs/<uuid>` keys, one per version.
+They keep working as they are. To move them to content keys while the server runs:
+
+```sh
+file-share migrate-blobs -dry-run -verify  # read-only: counts, bytes, savings, bad objects
+file-share migrate-blobs -limit 1          # move one object first and check it
+file-share migrate-blobs                   # move the rest; safe to stop and rerun
+file-share cleanup-legacy-blobs            # read-only: what cleanup would delete
+file-share cleanup-legacy-blobs -confirm   # delete the old objects
+```
+
+Each command reads the same environment as the server and prints a JSON report. A dry run
+opens PostgreSQL in read-only transactions without running migrations, and wraps the bucket
+so writes fail. A real run hashes each old object, skips any whose bytes do not match the
+recorded size and SHA-256 (or that are missing), copies it to its content key unless that
+content is already stored, re-reads and checks the copy, and only then repoints its versions
+in one transaction. Each object commits on its own, so an interrupted run can simply be
+started again. Old objects stay in place, and the purge leaves them alone, until
+`cleanup-legacy-blobs -confirm` deletes those that nothing references any more.
 
 ## Configuration
 

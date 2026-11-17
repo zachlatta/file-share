@@ -3,7 +3,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,7 +17,9 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/zachlatta/file-share/internal/app"
+	"github.com/zachlatta/file-share/internal/blob"
 	"github.com/zachlatta/file-share/internal/config"
+	"github.com/zachlatta/file-share/internal/files"
 )
 
 func main() {
@@ -32,8 +36,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "version":
 		fmt.Fprintln(stdout, os.Getenv("SOURCE_COMMIT"))
 		return 0
+	case "migrate-blobs", "cleanup-legacy-blobs":
+		return runBlobCommand(command, args[1:], stdout, stderr)
 	default:
-		fmt.Fprintln(stderr, "usage: file-share [serve|version]")
+		fmt.Fprintln(stderr, "usage: file-share [serve|version|migrate-blobs|cleanup-legacy-blobs]")
 		return 2
 	}
 	_ = godotenv.Load() // existing environment variables win
@@ -79,6 +85,68 @@ func run(args []string, stdout, stderr io.Writer) int {
 		shutdown, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdown)
+	}
+	return 0
+}
+
+// runBlobCommand runs migrate-blobs or cleanup-legacy-blobs against the
+// configured database and bucket, printing a JSON report on stdout and one
+// progress line per object on stderr. Dry runs open both read-only.
+func runBlobCommand(command string, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var dryRun, verify, confirm bool
+	var limit int
+	if command == "migrate-blobs" {
+		flags.BoolVar(&dryRun, "dry-run", false, "only report what a run would do; reads, never writes")
+		flags.BoolVar(&verify, "verify", false, "with -dry-run, also read every legacy object and check its SHA-256")
+		flags.IntVar(&limit, "limit", 0, "stop after this many objects (0: all)")
+	} else {
+		flags.BoolVar(&confirm, "confirm", false, "delete migrated legacy objects; without it, only report them")
+	}
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	readOnly := dryRun || (command == "cleanup-legacy-blobs" && !confirm)
+
+	_ = godotenv.Load()
+	cfg, err := config.Load(os.Getenv)
+	if err != nil {
+		fmt.Fprintf(stderr, "config: %v\n", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var store blob.Store
+	store, err = blob.NewS3(blob.S3Config{Endpoint: cfg.S3Endpoint, AccessKey: cfg.S3AccessKey, SecretKey: cfg.S3SecretKey, Bucket: cfg.S3Bucket, Region: cfg.S3Region})
+	if err != nil {
+		fmt.Fprintf(stderr, "object store: %v\n", err)
+		return 1
+	}
+	if readOnly {
+		store = blob.ReadOnly(store)
+	}
+	svc, err := files.Open(ctx, files.Config{DatabaseURL: cfg.DatabaseURL, Blobs: store, BaseURL: cfg.PublicURL,
+		Retention: cfg.Retention, MaxBytes: cfg.MaxUploadBytes, ReadOnly: readOnly})
+	if err != nil {
+		fmt.Fprintf(stderr, "files: %v\n", err)
+		return 1
+	}
+	defer svc.Close()
+
+	var report any
+	if command == "migrate-blobs" {
+		report, err = svc.MigrateBlobs(ctx, files.MigrateBlobsOptions{DryRun: dryRun, Verify: verify, Limit: limit,
+			Progress: func(line string) { fmt.Fprintln(stderr, line) }})
+	} else {
+		report, err = svc.CleanupLegacyBlobs(ctx, confirm)
+	}
+	enc := json.NewEncoder(stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(report)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", command, err)
+		return 1
 	}
 	return 0
 }

@@ -13,8 +13,10 @@
 
 ## Invariants
 
-- Blobs are immutable. Never overwrite an object key. A new version gets a new key; a rollback
-  reuses an existing key. Delete a blob only after no `versions` row references it.
+- Blobs are immutable. Never overwrite an object key. Bytes live at their content key
+  (`blobs/sha256/<hex>`): new content is copied there once, and identical content and rollbacks
+  reuse the existing key. Delete a blob only after no `versions` row references it, under its
+  blob lock.
 - Deletes are soft until the retention window passes. Only `Purge` (scheduled) and `PurgeFile`
   (explicit, `confirm=true`) destroy data.
 - Namespaces are random UUIDv4s. Never add a public listing, directory index, or any endpoint

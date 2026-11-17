@@ -1,7 +1,6 @@
-// Package blob stores immutable file bytes. Every file version is written
-// once under its own random key and never modified, so version history is a
-// property of the metadata database, not of the object store (Garage has no
-// S3 object versioning).
+// Package blob stores immutable file bytes. Callers write each key once and
+// never modify it, so version history is a property of the metadata
+// database, not of the object store (Garage has no S3 object versioning).
 package blob
 
 import (
@@ -20,7 +19,10 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-var ErrNotFound = errors.New("blob not found")
+var (
+	ErrNotFound = errors.New("blob not found")
+	ErrReadOnly = errors.New("blob store is read-only")
+)
 
 // Object is a seekable reader, so HTTP range requests can be served directly.
 type Object interface {
@@ -35,6 +37,11 @@ type Store interface {
 	Delete(ctx context.Context, key string) error
 	// List returns the objects whose keys start with prefix.
 	List(ctx context.Context, prefix string) ([]ObjectInfo, error)
+	// Stat describes key without reading it, or returns ErrNotFound.
+	Stat(ctx context.Context, key string) (ObjectInfo, error)
+	// Copy duplicates src to dst inside the store, or returns ErrNotFound if
+	// src is missing. Callers must make sure dst does not exist.
+	Copy(ctx context.Context, src, dst string) error
 	Ping(ctx context.Context) error
 }
 
@@ -99,6 +106,28 @@ func (m *Memory) List(_ context.Context, prefix string) ([]ObjectInfo, error) {
 	return out, nil
 }
 
+func (m *Memory) Stat(_ context.Context, key string) (ObjectInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.data[key]
+	if !ok {
+		return ObjectInfo{}, ErrNotFound
+	}
+	return ObjectInfo{Key: key, Size: int64(len(data)), Modified: m.modified[key]}, nil
+}
+
+func (m *Memory) Copy(_ context.Context, src, dst string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.data[src]
+	if !ok {
+		return ErrNotFound
+	}
+	m.data[dst] = bytes.Clone(data)
+	m.modified[dst] = m.Now()
+	return nil
+}
+
 func (m *Memory) Ping(context.Context) error { return nil }
 
 // Keys lists stored keys (test helper).
@@ -111,6 +140,16 @@ func (m *Memory) Keys() []string {
 	}
 	return keys
 }
+
+// ReadOnly wraps s so that reads pass through and writes fail with
+// ErrReadOnly.
+func ReadOnly(s Store) Store { return readOnly{s} }
+
+type readOnly struct{ Store }
+
+func (readOnly) Put(context.Context, string, io.Reader, int64, string) error { return ErrReadOnly }
+func (readOnly) Copy(context.Context, string, string) error                  { return ErrReadOnly }
+func (readOnly) Delete(context.Context, string) error                        { return ErrReadOnly }
 
 type nopCloser struct{ *bytes.Reader }
 
@@ -130,7 +169,13 @@ type S3Config struct {
 type S3 struct {
 	client *minio.Client
 	bucket string
+	// copyLimit is the largest object CopyObject handles in one request;
+	// larger objects use a multipart copy.
+	copyLimit int64
 }
+
+// maxSingleCopy is S3's limit for a single-request CopyObject.
+const maxSingleCopy = 5 << 30
 
 func NewS3(cfg S3Config) (*S3, error) {
 	u, err := url.Parse(cfg.Endpoint)
@@ -146,7 +191,7 @@ func NewS3(cfg S3Config) (*S3, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &S3{client: client, bucket: cfg.Bucket}, nil
+	return &S3{client: client, bucket: cfg.Bucket, copyLimit: maxSingleCopy}, nil
 }
 
 func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
@@ -205,6 +250,41 @@ func (s *S3) List(ctx context.Context, prefix string) ([]ObjectInfo, error) {
 		out = append(out, ObjectInfo{Key: obj.Key, Size: obj.Size, Modified: obj.LastModified})
 	}
 	return out, nil
+}
+
+func (s *S3) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	info, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		if isNotFound(err) {
+			return ObjectInfo{}, ErrNotFound
+		}
+		return ObjectInfo{}, err
+	}
+	return ObjectInfo{Key: key, Size: info.Size, Modified: info.LastModified}, nil
+}
+
+func (s *S3) Copy(ctx context.Context, src, dst string) error {
+	info, err := s.Stat(ctx, src)
+	if err != nil {
+		return err
+	}
+	srcOpts := minio.CopySrcOptions{Bucket: s.bucket, Object: src}
+	dstOpts := minio.CopyDestOptions{Bucket: s.bucket, Object: dst}
+	if info.Size <= s.copyLimit {
+		_, err = s.client.CopyObject(ctx, dstOpts, srcOpts)
+	} else {
+		// UploadPartCopy in parts of at most 5 GiB each.
+		_, err = s.client.ComposeObject(ctx, dstOpts, srcOpts)
+	}
+	if err != nil && isNotFound(err) {
+		return ErrNotFound
+	}
+	return err
+}
+
+func isNotFound(err error) bool {
+	code := minio.ToErrorResponse(err).Code
+	return code == "NoSuchKey" || code == "NotFound"
 }
 
 func (s *S3) Ping(ctx context.Context) error {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ type clock struct{ t time.Time }
 func (c *clock) now() time.Time { return c.t }
 
 type harness struct {
+	dbURL string
 	svc   *Service
 	blobs *blob.Memory
 	flaky *flakyBlobs
@@ -30,13 +32,64 @@ type harness struct {
 }
 
 // flakyBlobs fails every Delete while failDeletes is set, as when the object
-// store is down.
+// store is down. It also counts writes to blobs/ keys that already exist
+// (file bytes are immutable; chunked-upload parts may be re-sent) and runs
+// optional hooks before Stat, Copy and Delete.
 type flakyBlobs struct {
 	*blob.Memory
 	failDeletes atomic.Bool
+	overwrites  atomic.Int32
+	copies      atomic.Int32
+
+	hookMu       sync.Mutex
+	beforeStat   func(key string)
+	beforeCopy   func(src, dst string) error
+	beforeDelete func(key string)
+}
+
+func (f *flakyBlobs) hooks() (func(string), func(string, string) error, func(string)) {
+	f.hookMu.Lock()
+	defer f.hookMu.Unlock()
+	return f.beforeStat, f.beforeCopy, f.beforeDelete
+}
+
+func (f *flakyBlobs) setHooks(stat func(string), cp func(string, string) error, del func(string)) {
+	f.hookMu.Lock()
+	defer f.hookMu.Unlock()
+	f.beforeStat, f.beforeCopy, f.beforeDelete = stat, cp, del
+}
+
+func (f *flakyBlobs) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
+	if _, err := f.Memory.Stat(ctx, key); err == nil && strings.HasPrefix(key, "blobs/") {
+		f.overwrites.Add(1)
+	}
+	return f.Memory.Put(ctx, key, r, size, contentType)
+}
+
+func (f *flakyBlobs) Stat(ctx context.Context, key string) (blob.ObjectInfo, error) {
+	if hook, _, _ := f.hooks(); hook != nil {
+		hook(key)
+	}
+	return f.Memory.Stat(ctx, key)
+}
+
+func (f *flakyBlobs) Copy(ctx context.Context, src, dst string) error {
+	if _, hook, _ := f.hooks(); hook != nil {
+		if err := hook(src, dst); err != nil {
+			return err
+		}
+	}
+	if _, err := f.Memory.Stat(ctx, dst); err == nil && strings.HasPrefix(dst, "blobs/") {
+		f.overwrites.Add(1)
+	}
+	f.copies.Add(1)
+	return f.Memory.Copy(ctx, src, dst)
 }
 
 func (f *flakyBlobs) Delete(ctx context.Context, key string) error {
+	if _, _, hook := f.hooks(); hook != nil {
+		hook(key)
+	}
 	if f.failDeletes.Load() {
 		return errors.New("object store unavailable")
 	}
@@ -50,8 +103,9 @@ func newHarness(t *testing.T) *harness {
 	blobs := blob.NewMemory()
 	blobs.Now = c.now
 	flaky := &flakyBlobs{Memory: blobs}
+	dbURL := pgtest.New(t)
 	svc, err := Open(ctx, Config{
-		DatabaseURL: pgtest.New(t),
+		DatabaseURL: dbURL,
 		Blobs:       flaky,
 		BaseURL:     "https://files.example.com",
 		Retention:   30 * 24 * time.Hour,
@@ -63,7 +117,12 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	t.Cleanup(svc.Close)
-	return &harness{svc: svc, blobs: blobs, flaky: flaky, clock: c}
+	t.Cleanup(func() {
+		if n := flaky.overwrites.Load(); n != 0 {
+			t.Errorf("%d writes overwrote an existing object", n)
+		}
+	})
+	return &harness{dbURL: dbURL, svc: svc, blobs: blobs, flaky: flaky, clock: c}
 }
 
 func (h *harness) upload(t *testing.T, ns, name, body string) File {
