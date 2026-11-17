@@ -156,6 +156,26 @@ instead of this API, so they never need the secret.
 - `GET /<ns>/<name>` serves the current version with range requests, ETags and
   `Content-Disposition: inline`. Add `?download` to get an attachment instead.
 - `GET /<ns>/` serves `index.html` if the namespace has one.
+- **Markdown opens as a readable page in a browser, and stays a file everywhere else.** A file
+  stored as `text/markdown`, or as `text/plain` with a `.md`/`.markdown` name, is rendered like a
+  GitHub Gist (GitHub-flavored Markdown: tables, task lists, footnotes; light and dark theme)
+  when a browser navigates to it (`Sec-Fetch-Dest: document`). A client that sends no fetch
+  metadata gets the page only if its `Accept` gives `text/html` a strictly higher q than
+  `text/markdown`, `text/plain` and the stored type (counting `text/*` and `*/*`), so
+  `curl -H 'Accept: text/html'` and link-preview bots that prefer HTML get HTML too, while
+  `Accept: */*` or `text/markdown, text/html;q=0.5` get the bytes. Default `curl`, `wget`, most HTTP libraries,
+  `fetch()`, iframes and range requests get the exact stored bytes and Content-Type as before.
+  The page header has **Raw** (`?raw=1`, the bytes inline) and **Download** (`?download=1`)
+  links; if the page was opened with `?password=`, the links carry it over. Both forms send
+  `Vary: Accept, Sec-Fetch-Dest`; the page is `Cache-Control: private, no-store` and the bytes
+  `private, no-cache`, so no shared cache (Cloudflare ignores `Vary`) mixes them, and Markdown
+  is not cached at the edge. Each page view reads the file and renders it again.
+  The stored charset is honoured (for example `iso-8859-1`, `windows-1252`); no charset means
+  UTF-8. Files whose bytes are not valid in that charset, whose charset is unknown, or that
+  are over 512 KB are served raw. Raw HTML in the Markdown is dropped and the output is
+  sanitized (bluemonday); the page has a strict CSP with no script. Relative links and images
+  resolve next to the file. The page goes through the same password, Hack Club sign-in and
+  audit checks as the file.
 - HTML is served as an ordinary page, so uploaded sites and maps work fully. A CSP sandbox was
   tried and dropped, because the opaque origin it creates disables Cache Storage and broke a
   MapLibre map. This is safe because only the owner can upload, OAuth and the API never use

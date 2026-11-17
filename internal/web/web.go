@@ -160,8 +160,11 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		h.notFound(w, r, err)
 		return
 	}
+	var via string
 	if f.Restricted() {
-		via, email, denial := h.access(r, f)
+		var email string
+		var denial denial
+		via, email, denial = h.access(r, f)
 		if via == "" {
 			switch denial.event {
 			case "wrong_password":
@@ -181,6 +184,17 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	started := time.Now()
 	cw := &countingWriter{ResponseWriter: w}
+	if isMarkdown(f) {
+		// One URL, two forms: a page for browsers and the bytes for
+		// everything else. Cloudflare ignores Vary, so neither form may
+		// sit in a shared cache.
+		w.Header().Set("Vary", markdownVary)
+		w.Header().Set("Cache-Control", "private, no-cache")
+		if wantsPage(r, f) && h.servePage(cw, r, f, via) {
+			h.logRequest(r, f, cw, time.Since(started))
+			return
+		}
+	}
 	h.send(cw, r, f, 0)
 	h.logRequest(r, f, cw, time.Since(started))
 }

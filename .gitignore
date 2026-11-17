@@ -2,3 +2,5 @@
 .env
 .env.*
 !.env.example
+# Public repo: agent work items (reports, audits, scratch) belong in the private desk repo, not here.
+/work/
