@@ -49,11 +49,12 @@ https://files.zachlatta.com/<namespace-uuid>/<name>
   client can upload a local or large file with plain `curl` and never holds `MCP_SECRET` or
   base64s big files through a chat message. The link fixes the name (optional: omit it to use
   the uploaded file's name), namespace, password and allowed emails; the upload only sends the
-  bytes. It works once: a second upload returns `410 Gone`. A failed upload releases it for a
-  retry. The expiry is a deadline to start (default 60 minutes, max 24 hours).
+  bytes. It works once: a second upload returns `410 Gone`. If the upload response was lost,
+  query `GET <upload_url>?status` before retrying. A failed upload releases the link for a retry.
+  The expiry is a deadline to start (default 60 minutes, max 24 hours).
   Once a part is stored, the upload stays valid until 24 hours after the latest stored part. Proxies cap request
   bodies (Cloudflare rejects bodies over 100 MB) and time out slow single-stream uploads, so
-  files over 20 MB go up in parts: `PUT <url>?part=1..N` (each part 20 MB or less), then poll
+  files over 20 MiB go up in parts: `PUT <url>?part=1..N` (each part 20 MiB or less), then poll
   `POST <url>?complete=N` (plus `&name=` if the link has no name), which assembles the parts in
   the background and returns `202 Accepted` (`{"status":"assembling"}`) if still running after
   60 seconds, then `201 Created` (or `200 OK` when replacing) with the file JSON once done. The
@@ -83,6 +84,26 @@ Tools accept a file by ID, public URL, or `namespace/name`.
 `upload_file` and `replace_file` take exactly one content source. An empty `content_text` or
 `content_base64` is a source: it makes an empty file (such as a `.nojekyll` placeholder) or blanks
 an existing one. An empty request body does the same on the HTTP API.
+
+### Upload a local file
+
+1. With a connected MCP client, call `create_upload_url` with the `local_path` on the machine
+   that will run curl. Pass `name` to choose the file's name and `allowed_emails` to share with
+   specific people. With neither an email list nor a password, anyone with the file URL can open it.
+2. Check the file size against `max_upload_bytes` (also in `get_stats`, where it is available
+   before packaging the file). Run the returned `curl` up to `max_single_request_bytes`
+   (20 MiB) or `curl_chunked` above that threshold. Both use the same per-file limit.
+   Keep the grant and the commands that contain it private.
+3. Use the upload response's `url`, `sha256`, `version`, `content_type`, and access settings
+   to verify the result. Compare the checksum with your local bytes and check the file URL
+   anonymously. Expect `200` for a public file (`206` with a valid range request) or `401`
+   for a restricted file. Use a small range for large public files. The grant's `url` is the
+   planned file URL, so wait for upload completion before sharing it.
+
+For a local replacement, run `get_file` before editing and pass `file` and the version you
+built on as `expected_version` to `create_upload_url`. The replacement keeps the URL and
+access settings. On a version conflict, re-read the current version and rebuild your changes
+on it before requesting another grant.
 
 ## Authentication
 
@@ -148,7 +169,7 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' -H 'Accept: application/
 
 `/api/files` is a single-request upload endpoint (capped at 100 MB through Cloudflare and bound
 by the origin proxy's request read timeout). Use a signed upload URL (`create_upload_url`) with
-`curl_chunked` for anything over 20 MB. Agents connected over MCP should use `create_upload_url`
+`curl_chunked` for anything over 20 MiB. Agents connected over MCP should use `create_upload_url`
 instead of this API, so they never need the secret.
 
 ## Serving
@@ -156,6 +177,8 @@ instead of this API, so they never need the secret.
 - `GET /<ns>/<name>` serves the current version with range requests, ETags and
   `Content-Disposition: inline`. Add `?download` to get an attachment instead.
 - `GET /<ns>/` serves `index.html` if the namespace has one.
+- A file miss returns `404` with `Cache-Control: no-store` so caches that honor origin headers
+  can pick up a subsequent upload or restore at the same URL.
 - **Markdown opens as a readable page in a browser, and stays a file everywhere else.** A file
   stored as `text/markdown`, or as `text/plain` with a `.md`/`.markdown` name, is rendered like a
   GitHub Gist (GitHub-flavored Markdown: tables, task lists, footnotes; light and dark theme)

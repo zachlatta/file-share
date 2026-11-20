@@ -38,7 +38,7 @@ var (
 	ErrExists     = errors.New("a live file with that name already exists in the namespace")
 	ErrInvalid    = errors.New("invalid input")
 	ErrTooLarge   = errors.New("file is larger than the upload limit")
-	ErrLinkUsed   = errors.New("this upload link has already been used; create a new one")
+	ErrLinkUsed   = errors.New("this upload link is in use or already used. GET the same upload URL with ?status before retrying")
 	ErrConflict   = errors.New("the file changed since you read it")
 	ErrAssembling = errors.New("upload is still assembling")
 )

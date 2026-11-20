@@ -107,6 +107,11 @@ func TestCatalog(t *testing.T) {
 	if !strings.Contains(s.InitializeResult().Instructions, "30 days") {
 		t.Errorf("instructions should state retention: %q", s.InitializeResult().Instructions)
 	}
+	for _, hint := range []string{"local_path", "max_upload_bytes", "sha256", "anonymous GET"} {
+		if !strings.Contains(s.InitializeResult().Instructions, hint) {
+			t.Errorf("instructions should explain %s", hint)
+		}
+	}
 }
 
 func TestUploadReadReplaceRollback(t *testing.T) {
@@ -260,6 +265,11 @@ func TestDeleteRestorePurgeAndPasswords(t *testing.T) {
 
 func TestSignedURLsAndSourceURL(t *testing.T) {
 	s := connect(t)
+	var metadata map[string]any
+	ok(t, call(t, s, "create_upload_url", map[string]any{"name": "example.txt"}), &metadata)
+	if metadata["max_upload_bytes"] != float64(1<<20) || metadata["max_single_request_bytes"] != float64(20<<20) {
+		t.Fatal("upload grant should expose distinct upload and single-request limits in bytes")
+	}
 	var up uploadURLOutput
 	ok(t, call(t, s, "create_upload_url", map[string]any{"name": "big.mov", "password": "pw", "allowed_emails": []string{"@hackclub.com"}}), &up)
 	if !strings.HasPrefix(up.UploadURL, "https://files.example.com/upload/") || !strings.Contains(up.Curl, "curl -sS --fail-with-body -F 'file=@") ||
@@ -382,6 +392,10 @@ func TestReplaceWithExpectedVersion(t *testing.T) {
 	s := connect(t)
 	var f files.File
 	ok(t, call(t, s, "upload_file", map[string]any{"name": "db.json", "content_text": "{}"}), &f)
+	collision := call(t, s, "create_upload_url", map[string]any{"namespace": f.Namespace, "name": f.Name})
+	if body := text(collision); !collision.IsError || !strings.Contains(body, "get_file") || !strings.Contains(body, "expected_version") {
+		t.Fatalf("name collision should explain how to replace deliberately: %s", body)
+	}
 	ok(t, call(t, s, "replace_file", map[string]any{"file": f.ID, "content_text": `{"a":1}`, "expected_version": 1}), &f)
 	res := call(t, s, "replace_file", map[string]any{"file": f.ID, "content_text": `{"b":1}`, "expected_version": 1})
 	if !res.IsError || !strings.Contains(text(res), "version 2") {

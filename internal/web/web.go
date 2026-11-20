@@ -313,6 +313,8 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request, f files.File, ver
 
 func (h *Handler) notFound(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, files.ErrNotFound) {
+		// A file can be uploaded or restored at this URL after the miss.
+		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
 		return
 	}
@@ -680,6 +682,8 @@ func (h *Handler) apiList(w http.ResponseWriter, r *http.Request) {
 // bytes and, if the link has no name, the file name (multipart file name or
 // ?name=).
 func (h *Handler) signedUpload(w http.ResponseWriter, r *http.Request) {
+	// Status changes as parts arrive and carries metadata behind the grant.
+	w.Header().Set("Cache-Control", "private, no-store")
 	linkID, err := h.auth.VerifyUpload(r.PathValue("token"))
 	if err != nil {
 		http.Error(w, "invalid or expired upload link", http.StatusUnauthorized)

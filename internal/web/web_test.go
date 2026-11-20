@@ -363,8 +363,12 @@ func TestSignedUploadURL(t *testing.T) {
 		t.Fatalf("file = %+v", f)
 	}
 	// One-off: the link stops working once used.
-	if rec := e.do(httptest.NewRequest(http.MethodPut, path, strings.NewReader("again"))); rec.Code != http.StatusGone {
+	if rec := e.do(httptest.NewRequest(http.MethodPut, path, strings.NewReader("again"))); rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), "?status") {
 		t.Fatalf("reused link: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do(httptest.NewRequest(http.MethodGet, path+"?status", nil)); rec.Code != http.StatusOK ||
+		rec.Header().Get("Cache-Control") != "private, no-store" || !strings.Contains(rec.Body.String(), f.SHA256) {
+		t.Fatalf("completed status: %d %s %s", rec.Code, rec.Header().Get("Cache-Control"), rec.Body)
 	}
 	// Replace link; multipart works too.
 	path = e.link(t, files.UploadLinkInput{FileID: f.ID})
@@ -376,6 +380,33 @@ func TestSignedUploadURL(t *testing.T) {
 	}
 	if rec := e.do(httptest.NewRequest(http.MethodPut, "/upload/garbage", strings.NewReader("x"))); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("bad token: %d", rec.Code)
+	}
+}
+
+func TestFileMissIsNotCacheableBeforeUpload(t *testing.T) {
+	e := newEnv(t)
+	link, err := e.files.CreateUploadLink(t.Context(), files.UploadLinkInput{
+		Name: "index.html", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/" + link.Namespace + "/"
+	for _, target := range []string{path, path + "index.html"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			rec := e.do(httptest.NewRequest(method, target, nil))
+			if rec.Code != http.StatusNotFound || rec.Header().Get("Cache-Control") != "no-store" {
+				t.Errorf("%s %s: got %d, Cache-Control %q", method, target, rec.Code, rec.Header().Get("Cache-Control"))
+			}
+		}
+	}
+	uploadPath := "/upload/" + e.auth.SignUpload(link.ID, time.Hour)
+	if rec := e.do(httptest.NewRequest(http.MethodPut, uploadPath, strings.NewReader("<h1>Ready</h1>"))); rec.Code != http.StatusCreated {
+		t.Fatalf("upload: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do(httptest.NewRequest(http.MethodGet, path, nil)); rec.Code != http.StatusOK ||
+		!strings.HasPrefix(rec.Header().Get("Cache-Control"), "public,") {
+		t.Fatalf("published index: %d %v", rec.Code, rec.Header())
 	}
 }
 
