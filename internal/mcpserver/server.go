@@ -364,10 +364,14 @@ func (s *server) upload(ctx context.Context, in UploadInput) (files.File, error)
 	if name == "" {
 		name = suggested
 	}
-	return s.files.Upload(ctx, files.UploadInput{
+	f, err := s.files.Upload(ctx, files.UploadInput{
 		Namespace: in.Namespace, Name: name, ContentType: contentType, Body: body, Size: size,
 		Password: in.Password, AllowedEmails: in.AllowedEmails, Client: client(ctx), ExpiresAt: expiry,
 	})
+	if errors.Is(err, files.ErrExists) {
+		return files.File{}, fmt.Errorf("%w. Choose a new name, or call get_file and replace_file with file and expected_version to replace it", err)
+	}
+	return f, err
 }
 
 func (s *server) replace(ctx context.Context, in ReplaceInput) (files.File, error) {

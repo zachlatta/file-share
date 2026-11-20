@@ -396,6 +396,10 @@ func TestReplaceWithExpectedVersion(t *testing.T) {
 	if body := text(collision); !collision.IsError || !strings.Contains(body, "get_file") || !strings.Contains(body, "expected_version") {
 		t.Fatalf("name collision should explain how to replace deliberately: %s", body)
 	}
+	collision = call(t, s, "upload_file", map[string]any{"namespace": f.Namespace, "name": f.Name, "content_text": "{}"})
+	if body := text(collision); !collision.IsError || !strings.Contains(body, "replace_file") || !strings.Contains(body, "expected_version") {
+		t.Fatalf("inline name collision should explain how to replace deliberately: %s", body)
+	}
 	ok(t, call(t, s, "replace_file", map[string]any{"file": f.ID, "content_text": `{"a":1}`, "expected_version": 1}), &f)
 	res := call(t, s, "replace_file", map[string]any{"file": f.ID, "content_text": `{"b":1}`, "expected_version": 1})
 	if !res.IsError || !strings.Contains(text(res), "version 2") {
