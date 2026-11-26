@@ -7,7 +7,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/file-share ./cmd/file-share
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates wget && adduser -D -u 10001 app
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates wget && adduser -D -u 10001 app
 COPY --from=build /out/file-share /usr/local/bin/file-share
 USER app
 ENV ADDR=0.0.0.0:8080
